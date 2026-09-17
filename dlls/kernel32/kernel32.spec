@@ -524,7 +524,7 @@
 @ stdcall -import FlsAlloc(ptr)
 @ stdcall -import FlsFree(long)
 @ stdcall -import FlsGetValue(long)
-@ stdcall -import FlsGetValue2(long) FlsGetValue
+@ stdcall -import FlsGetValue2(long)
 @ stdcall -import FlsSetValue(long ptr)
 @ stdcall -import FlushConsoleInputBuffer(long)
 @ stdcall -import FlushFileBuffers(long)
