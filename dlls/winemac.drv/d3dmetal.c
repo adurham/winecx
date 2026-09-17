@@ -110,7 +110,7 @@ static struct d3dmetal_macdrv_win_data *my_get_win_data(HWND hwnd)
      * get_win_data() -> create_metal_device() -> create_metal_view() -> get_metal_layer() -> release_win_data()
      */
     {
-        struct client_surface *base = macdrv_CreateClientSurface(hwnd, 0);
+        struct client_surface *base = macdrv_CreateClientSurface(hwnd, 0, FALSE);
         client_surface = base ? impl_from_client_surface(base) : NULL;
     }
     if (!client_surface) return NULL;
