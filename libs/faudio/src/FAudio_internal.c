@@ -1194,7 +1194,7 @@ static void FAudio_INTERNAL_MixSource(FAudioSourceVoice *voice)
 		voice->src.resample(
 			voice->audio->decoded_audio,
 			dst,
-			&voice->src.resampleOffset,
+			(uint64_t *)&voice->src.resampleOffset,
 			voice->src.resampleStep,
 			toResample - tap_samples,
 			channels
