@@ -119,6 +119,16 @@ static struct d3dmetal_macdrv_win_data *my_get_win_data(HWND hwnd)
         return NULL;
     }
 
+    /* an offscreen tree has no cocoa view to hand out, and d3dmetal has no
+     * cross-process path here; decline rather than pass it a null view */
+    if (client_surface->swapchain)
+    {
+        FIXME("cross-process d3dmetal swapchains are not implemented, hwnd %p\n", hwnd);
+        release_win_data(data);
+        client_surface_release((struct client_surface *)client_surface);
+        return NULL;
+    }
+
     macdrv_set_view_d3dmetal_client_surface(client_surface->cocoa_view, &client_surface->client);
 
     if (!data->d3dmetal_client_surfaces)

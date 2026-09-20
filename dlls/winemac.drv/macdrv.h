@@ -100,6 +100,8 @@ enum macdrv_window_messages
 {
     WM_MACDRV_SET_WIN_REGION = WM_WINE_FIRST_DRIVER_MSG,
     WM_MACDRV_ACTIVATE_ON_FOLLOWING_FOCUS,
+    WM_MACDRV_CREATE_REMOTE_LAYER,
+    WM_MACDRV_RELEASE_REMOTE_LAYER,
 };
 
 struct macdrv_thread_data
@@ -184,6 +186,9 @@ struct macdrv_win_data
     HWND                hwnd;                   /* hwnd that this private data belongs to */
     macdrv_window       cocoa_window;
     macdrv_view         client_view;
+    macdrv_view         remote_layer_view;  /* hosts layer trees published by other processes */
+    struct remote_layer_entry *remote_layers;   /* which context hosts which child hwnd */
+    unsigned int        remote_layer_count;
     struct window_rects rects;                  /* window rects in monitor DPI, relative to parent client area */
     int                 pixel_format;           /* pixel format for GL */
     HANDLE              drag_event;             /* event to signal that Cocoa-driven window dragging has ended */
@@ -205,6 +210,12 @@ struct macdrv_client_surface
     macdrv_view           cocoa_view;
     macdrv_metal_device   metal_device;
     macdrv_metal_view     metal_view;
+
+    /* set instead of the three above when the top level belongs to another
+     * process: an offscreen layer tree published over a CAContext, which that
+     * process hosts with a CALayerHost */
+    macdrv_metal_swapchain swapchain;
+    HWND                   remote_toplevel;
 };
 
 static inline struct macdrv_client_surface *impl_from_client_surface(struct client_surface *client)
@@ -214,6 +225,13 @@ static inline struct macdrv_client_surface *impl_from_client_surface(struct clie
 
 extern struct macdrv_client_surface *macdrv_client_surface_create(HWND hwnd);
 
+struct remote_layer_entry
+{
+    unsigned int ctx;
+    HWND         hwnd;
+};
+
+extern void macdrv_resync_remote_layers(HWND toplevel);
 extern struct macdrv_win_data *get_win_data(HWND hwnd);
 extern void release_win_data(struct macdrv_win_data *data);
 extern void init_win_context(void);

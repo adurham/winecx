@@ -46,14 +46,26 @@ static const struct vulkan_driver_funcs macdrv_vulkan_driver_funcs;
 static VkResult macdrv_vulkan_surface_create(HWND hwnd, const struct vulkan_instance *instance, VkSurfaceKHR *handle,
                                              struct client_surface **client)
 {
-    VkResult res;
     struct macdrv_client_surface *surface;
+    macdrv_metal_layer layer;
+    VkResult res;
 
     TRACE("%p %p %p %p\n", hwnd, instance, handle, client);
 
     if (!(surface = macdrv_client_surface_create(hwnd))) return VK_ERROR_OUT_OF_HOST_MEMORY;
-    if (!(surface->metal_device = macdrv_create_metal_device())) goto err;
-    if (!(surface->metal_view = macdrv_view_create_metal_view(surface->cocoa_view, surface->metal_device))) goto err;
+
+    if (surface->swapchain)
+    {
+        /* the top level is another process's; we render into an offscreen tree
+         * that it hosts, so present against that tree's layer */
+        layer = macdrv_swapchain_get_layer(surface->swapchain);
+    }
+    else
+    {
+        if (!(surface->metal_device = macdrv_create_metal_device())) goto err;
+        if (!(surface->metal_view = macdrv_view_create_metal_view(surface->cocoa_view, surface->metal_device))) goto err;
+        layer = macdrv_view_get_metal_layer(surface->metal_view);
+    }
 
     if (instance->p_vkCreateMetalSurfaceEXT)
     {
@@ -61,7 +73,7 @@ static VkResult macdrv_vulkan_surface_create(HWND hwnd, const struct vulkan_inst
         create_info_host.sType = VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT;
         create_info_host.pNext = NULL;
         create_info_host.flags = 0; /* reserved */
-        create_info_host.pLayer = macdrv_view_get_metal_layer(surface->metal_view);
+        create_info_host.pLayer = layer;
 
         res = instance->p_vkCreateMetalSurfaceEXT(instance->host.instance, &create_info_host, NULL /* allocator */, handle);
     }
@@ -71,7 +83,7 @@ static VkResult macdrv_vulkan_surface_create(HWND hwnd, const struct vulkan_inst
         create_info_host.sType = VK_STRUCTURE_TYPE_MACOS_SURFACE_CREATE_INFO_MVK;
         create_info_host.pNext = NULL;
         create_info_host.flags = 0; /* reserved */
-        create_info_host.pView = macdrv_view_get_metal_layer(surface->metal_view);
+        create_info_host.pView = layer;
 
         res = instance->p_vkCreateMacOSSurfaceMVK(instance->host.instance, &create_info_host, NULL /* allocator */, handle);
     }
