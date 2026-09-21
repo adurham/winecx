@@ -1275,9 +1275,28 @@ static unsigned int resync_walk(struct macdrv_win_data *data, HWND hwnd, unsigne
     for (child = NtUserGetWindowRelative(hwnd, GW_CHILD); child;
          child = NtUserGetWindowRelative(child, GW_HWNDNEXT))
     {
+        unsigned int newest = ~0u;
+
+        /* A client recreates its CAContext when the window is reconfigured, and
+         * the matching release is not always delivered, so several entries can
+         * name the same child.  Every one of them used to be shown, and since
+         * entries are appended while the z-order below is handed out
+         * descending, the OLDEST context ended up on top -- an opaque dead
+         * frame covering the live one.  Chromium does this on every resize,
+         * which left steam's page content hidden under a stale surface.
+         * Show only the most recent entry for a child; hide the rest. */
+        for (i = 0; i < data->remote_layer_count; i++)
+            if (data->remote_layers[i].hwnd == child) newest = i;
+
         for (i = 0; i < data->remote_layer_count; i++)
         {
             if (data->remote_layers[i].hwnd != child) continue;
+            if (i != newest)
+            {
+                TRACE("hiding stale context %u for %p\n", data->remote_layers[i].ctx, child);
+                macdrv_window_set_ca_layer_host_state(data->cocoa_window, data->remote_layers[i].ctx, TRUE, 0.0);
+                continue;
+            }
             macdrv_window_set_ca_layer_host_state(data->cocoa_window, data->remote_layers[i].ctx,
                                                   !NtUserIsWindowVisible(child), (double)next_z);
             next_z--;
