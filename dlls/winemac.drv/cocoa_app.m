@@ -838,7 +838,27 @@ static NSString* WineLocalizedString(unsigned int stringID)
             }
             else if (displaysCapturedForFullscreen)
             {
-                if ([originalDisplayModes count] || CGReleaseAllDisplays() == CGDisplayNoErr)
+                /* Release the capture, and keep the flag set until the release
+                 * actually succeeds so a failure is retried on the next pass.
+                 *
+                 * This used to be one `||` expression:
+                 *     if ([originalDisplayModes count] || CGReleaseAllDisplays() == CGDisplayNoErr)
+                 * `||` short-circuits, so whenever originalDisplayModes was
+                 * non-empty the condition was true WITHOUT calling
+                 * CGReleaseAllDisplays() -- the capture leaked, yet the flag was
+                 * cleared so nothing ever retried.  (The originalDisplayModes
+                 * term is about whether wine still owes a mode restore, which
+                 * is a separate concern from relinquishing the capture; both
+                 * paths here need the release.)
+                 *
+                 * Measured consequence: after a game exits,
+                 * CGDisplayIsCaptured() stays 1 with no game alive.  A captured
+                 * display REFUSES mode changes, so restoring the desktop mode
+                 * lands on some other mode with the same point size
+                 * (observed: asked for mode 149, ended up on mode 99, a 1x
+                 * mode), and the user sees the desktop squeezed into part of
+                 * the panel until something forces a re-layout. */
+                if (CGReleaseAllDisplays() == CGDisplayNoErr)
                     displaysCapturedForFullscreen = FALSE;
             }
         }
