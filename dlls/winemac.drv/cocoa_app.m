@@ -950,6 +950,50 @@ static NSString* WineLocalizedString(unsigned int stringID)
         NSNumber* displayIDKey = [NSNumber numberWithUnsignedInt:displayID];
         CGDisplayModeRef originalMode;
 
+        /* OPT-IN: leave display-mode changes to an external helper.
+         *
+         * Set WHISKY_EXTERNAL_MODE_CONTROL=1 and this driver stops changing
+         * display modes entirely.  It still captures displays (see
+         * updateFullscreenWindows) so fullscreen still hides the menu bar and
+         * Dock; it simply does not touch the mode.
+         *
+         * WHY THIS IS NEEDED: two writers cannot share one display.  When an
+         * external helper switches the display to the game's resolution FIRST,
+         * wine's setMode: runs afterwards, finds that mode already current,
+         * and at line ~1018 records *that* as the "original" mode to restore
+         * on teardown.  It then dutifully restores the GAME's mode when the
+         * game exits, stamping over the helper's correct restore -- observed
+         * as "game set 2560x1440" immediately after the helper logged
+         * "restored desktop".
+         *
+         * A second, independent reason: wine's own restore uses
+         * CGDisplaySetDisplayMode with a CGDisplayModeRef, which fails with
+         * kCGErrorFailure (1000) for a scaled HiDPI mode that
+         * CGDisplayCopyDisplayMode does not expose, so its restore silently
+         * cannot work for this display anyway.
+         *
+         * With the flag set, originalDisplayModes stays empty: nothing was
+         * changed, so nothing needs restoring, and the error-1000 path is
+         * never reached.  The other restore sites (handleCommandTab, the
+         * permission dialog) simply find nothing to do.
+         *
+         * Trade-off, stated plainly: a game that changes resolution WHILE
+         * running will no longer be honoured by the driver.  Intended for a
+         * fixed game in a fixed mode with an external controller present. */
+        {
+            const char *external = getenv("WHISKY_EXTERNAL_MODE_CONTROL");
+            if (external && external[0] == '1')
+            {
+                /* NSLog rather than TRACE: this file is Objective-C and does
+                 * not include wine's debug-channel macros. */
+                NSLog(@"winemac: setMode: skipped for display %u, "
+                       "WHISKY_EXTERNAL_MODE_CONTROL=1 "
+                       "(the display mode is owned by an external helper)",
+                      (unsigned)displayID);
+                return FALSE;
+            }
+        }
+
         originalMode = (CGDisplayModeRef)originalDisplayModes[displayIDKey];
 
         if (originalMode && [self mode:mode matchesMode:originalMode])
