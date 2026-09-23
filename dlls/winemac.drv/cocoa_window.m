@@ -18,13 +18,16 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
-#include "config.h"
+#import "config.h"
 
 #define GL_SILENCE_DEPRECATION
 #import <CoreVideo/CoreVideo.h>
+#import <IOKit/IOKitLib.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
 #include <dlfcn.h>
+#include <objc/runtime.h>
+#include <stdlib.h>
 
 #import "cocoa_window.h"
 
@@ -35,6 +38,14 @@
 #import "d3dmetal_objc.h" /* CW HACK 22435 */
 
 #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
+
+
+/* Declared here because the frame-rate-range carrier below (which runs before
+   the WineBaseView/WineContentView implementations, and must, because
+   -[WineMetalLayer nextDrawable] in d3dmetal_objc.m calls into it) needs to
+   name them. */
+@class WineContentView;
+@class WineMetalView;
 
 
 @interface NSWindow (PrivatePreventsActivation)
@@ -334,6 +345,726 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 }
 
 @end
+
+
+/***********************************************************************
+ *              Frame-rate-range carrier (OPT-IN)
+ *
+ * WHAT THIS IS FOR
+ *
+ * A game that caps itself at 60 fps on a display running at 240 Hz has its
+ * frames presented 4 or 5 vblanks apart in a repeating pattern, which reads as
+ * judder, because no one has told macOS the cadence the content is produced at.
+ * macOS can lower the display's refresh to follow the content instead, but only
+ * when an application DECLARES a cadence.  D3DMetal declares none, so games
+ * running on this driver never get that.
+ *
+ * WHAT MOVES THIS PANEL, AND WHAT DOES NOT (measured 2026-09-23, AW3425DW,
+ * six fullscreen colour-coded A/B arms with the monitor's own OSD as the only
+ * instrument -- see ~/whisky-gptk-writeup/VRR-EXTERNAL-PANEL-ROOTCAUSE-20260923.md)
+ *
+ * - A CADisplayLink carrying a CAFrameRateRange does NOTHING on this external
+ *   panel, at ANY range (48..240 pref 60, 60..60, 48..60 all left it at 240 Hz),
+ *   attached to EITHER the content view OR the presenting view.  That was the
+ *   previous shape here and it is why it was replaced.
+ * - A CAMetalDisplayLink whose callback actually PRESENTS a drawable DOES move
+ *   the panel (measured 48-240 Hz movement).
+ * - The same link with a no-op callback does not move it.  The panel follows
+ *   PRESENTATION CADENCE, not a declared range.
+ *
+ * WHY THE LINK CANNOT GO ON THE GAME'S OWN LAYER
+ *
+ * CAMetalDisplayLink takes exclusive ownership of its layer's drawables:
+ * QuartzCore raises CAMetalLayerInvalidOperation ("-nextDrawable should not be
+ * called when using CAMetalDisplayLink") as soon as -nextDrawable is called on a
+ * layer owned by one.  D3DMetal presents through -nextDrawable (see
+ * -[WineMetalLayer nextDrawable] in d3dmetal_objc.m), so a link on that layer
+ * would break every game.  Measured: 360/360 nextDrawable calls succeeded before
+ * such a link existed, 357/360 raised after.
+ *
+ * THE SHAPE USED HERE -- A CARRIER LAYER (verified by probe frr_seq4.m)
+ *
+ * A SEPARATE carrier CAMetalLayer -- 1x1, non-opaque, added as a sublayer of the
+ * wine metal view -- with its OWN CAMetalDisplayLink whose callback presents the
+ * CARRIER's own drawable.  In the probe this moved the panel to 48-240 Hz while
+ * the game layer kept presenting untouched (960 game presents per 16 s arm at
+ * 60 fps).  The carrier is the sole owner of its own layer, so the
+ * nextDrawable prohibition never comes into play: nothing else ever calls
+ * -nextDrawable on the carrier, and the carrier's callback never touches the
+ * presenting layer or its drawables.
+ *
+ * ATTACH POINT
+ *
+ * The carrier is a sublayer of the wine metal view's backing layer (the
+ * WineMetalLayer D3DMetal presents through) -- the exact shape the probe
+ * verified.  Being a sublayer, it is a different CALayer object from the
+ * presenting layer, and the nextDrawable prohibition is per-layer, not
+ * per-subtree: only a layer actually handed to -initWithMetalLayer: is owned by
+ * a link.  1x1 at the layer's origin, contentsScale 1.0, non-opaque, and no
+ * autoresizing, so it cannot affect layout or the presenting layer's geometry;
+ * it is not a view, so it takes no part in hit-testing.
+ *
+ * The function is called from -[WineMetalLayer nextDrawable], which is the one
+ * place that reliably identifies "this window is presenting D3DMetal content".
+ *
+ * THE RANGE
+ *
+ * The display's OWN variable-refresh range, read from the system at runtime.
+ * Not hardcoded, and never taken from any particular game's frame rate.
+ *
+ * NSScreen.minimumRefreshInterval / maximumRefreshInterval are NOT usable here:
+ * on the AW3425DW both report the current mode's period (240 Hz / 240 Hz), i.e.
+ * no range at all.
+ *
+ * The authoritative source is the per-connector IORegistry node
+ * ("IOMobileFramebufferShim").  Its "DisplayAttributes" dictionary carries, for
+ * the AW3425DW:
+ *      SupportsVariableRefreshRate = 1
+ *      MinimumRefreshRate          = 48
+ *      MaximumRefreshRate          = 240
+ * matching what macOS's Displays settings shows the user for this panel
+ * ("Variable (48-240 Hertz)").  Node identification matters: the same registry
+ * also contains per-timing-element values in 16.16 fixed point
+ * (MinimumVariableRefreshRate 3145728 = 48.000, MaximumVariableRefreshRate
+ * 15728640 = 240.000).  This code requires SupportsVariableRefreshRate, requires
+ * Minimum/MaximumRefreshRate to be plain-integer CFNumbers, and requires
+ * min < max -- so a node offering only the fixed-point per-element values, or
+ * only one rate, is rejected rather than silently producing a bogus range.
+ *
+ * The join from a display to its node is by (vendor, model, serial) matched
+ * against the node's ProductAttributes triple.  The joins that look more
+ * obvious do not work on this system, all verified: CGDisplayIOServicePort()
+ * returns 0 for every display; CGDisplayCreateUUIDFromDisplayID() does not
+ * equal the node's "EDID UUID"; and IODisplayForFramebuffer() with a
+ * CGDirectDisplayID returns 0.
+ *
+ * THE RANGE FIELD THAT MATTERS
+ *
+ * CAFrameRateRangeMake(min, max, preferred) takes effect as
+ * clamp(preferred, min, max), and preferred == 0 means "use the maximum".  So
+ * the ONLY field that can lower the display's rate is `preferred`: declaring the
+ * display's full range with preferred at the top -- (48, 240, 240) -- is
+ * measurably identical to declaring nothing at all.  The rate cannot come from
+ * the display's capability; it has to come from the game, which cannot express
+ * it (Windows has no equivalent), so it comes from the user:
+ *
+ *   WHISKY_DECLARE_FRAME_RATE_PREFERRED=<hz>
+ *
+ * e.g. 60 for a 60fps-capped title.  With no override, prefer the display's
+ * MINIMUM rather than its maximum: that at least permits the panel to run as
+ * slowly as the display allows.
+ *
+ * RELATION TO THE EXISTING CVDisplayLink
+ *
+ * wine already has a per-display CVDisplayLink (WineDisplayLink, above), but it
+ * exists to drive -displayIfNeeded for windows with pending drawing, it is
+ * keyed by display rather than by window, and being a CVDisplayLink it has no
+ * preferredFrameRateRange at all.  It cannot carry a cadence declaration, so a
+ * separate object is required.  The two coexist and do not interact.
+ */
+
+
+/* The display's own variable-refresh range, read from the IORegistry.
+   Returns FALSE if the connected display does not advertise one. */
+static BOOL wine_get_display_vrr_range(CGDirectDisplayID display_id,
+                                       uint32_t* out_min, uint32_t* out_max)
+{
+    io_iterator_t iterator = 0;
+    io_registry_entry_t node = 0;
+    CFTypeRef attrs = NULL, value = NULL;
+    uint32_t min_rate = 0, max_rate = 0;
+    const uint32_t vendor = CGDisplayVendorNumber(display_id);
+    const uint32_t model = CGDisplayModelNumber(display_id);
+    const uint32_t serial = CGDisplaySerialNumber(display_id);
+    BOOL ret = FALSE;
+
+    /* Identity is taken from CoreGraphics, and the match is by
+       (vendor, model, serial), because every other join that looks obvious
+       does not work on this system:
+         - CGDisplayIOServicePort() returns 0 for every display here;
+         - CGDisplayCreateUUIDFromDisplayID() does NOT equal the node's
+           "EDID UUID" property, so the UUID join never matches;
+         - IODisplayForFramebuffer((io_service_t)display_id) returns 0.
+       The ProductAttributes triple is exact, and requires all three to agree:
+       tested on a two-display system, matching the AW3425DW uniquely and
+       matching nothing for the built-in panel (whose node carries an
+       abbreviated ProductAttributes with no SerialNumber at all). */
+    if (IOServiceGetMatchingServices(kIOMainPortDefault,
+                                     IOServiceMatching("IOMobileFramebufferShim"),
+                                     &iterator) != KERN_SUCCESS || !iterator)
+        return FALSE;
+
+    while ((node = IOIteratorNext(iterator)))
+    {
+        CFTypeRef product;
+        long long node_vendor = -1, node_model = -1, node_serial = -1;
+
+        attrs = IORegistryEntryCreateCFProperty(node, CFSTR("DisplayAttributes"),
+                                                kCFAllocatorDefault, 0);
+        if (!attrs || CFGetTypeID(attrs) != CFDictionaryGetTypeID())
+            goto next;
+
+        product = CFDictionaryGetValue(attrs, CFSTR("ProductAttributes"));
+        if (!product || CFGetTypeID(product) != CFDictionaryGetTypeID())
+            goto next;
+
+        value = CFDictionaryGetValue(product, CFSTR("LegacyManufacturerID"));
+        if (!value || CFGetTypeID(value) != CFNumberGetTypeID() ||
+            !CFNumberGetValue(value, kCFNumberLongLongType, &node_vendor))
+            goto next;
+        value = CFDictionaryGetValue(product, CFSTR("ProductID"));
+        if (!value || CFGetTypeID(value) != CFNumberGetTypeID() ||
+            !CFNumberGetValue(value, kCFNumberLongLongType, &node_model))
+            goto next;
+        value = CFDictionaryGetValue(product, CFSTR("SerialNumber"));
+        if (!value || CFGetTypeID(value) != CFNumberGetTypeID() ||
+            !CFNumberGetValue(value, kCFNumberLongLongType, &node_serial))
+            goto next;
+
+        if (node_vendor != (long long)vendor || node_model != (long long)model ||
+            node_serial != (long long)serial)
+            goto next;
+
+        /* This node is this display.  Now the range -- and specifically the
+           CONNECTOR-level range, not the per-timing-element values that share
+           the same dictionary.  Minimum/MaximumRefreshRate are plain integers
+           and are the display's variable range (48/240 on the AW3425DW, which
+           is what macOS's Displays settings shows the user).  The
+           Minimum/MaximumVariableRefreshRate keys on the same node are 16.16
+           fixed point (3145728 = 48.000, 15728640 = 240.000) and are per
+           element, so they are deliberately not read here.  Requiring
+           SupportsVariableRefreshRate and min < max means a fixed-rate display
+           is rejected outright rather than read as a 0..N range. */
+        value = CFDictionaryGetValue(attrs, CFSTR("SupportsVariableRefreshRate"));
+        if (!value || CFGetTypeID(value) != CFBooleanGetTypeID() || !CFBooleanGetValue(value))
+            goto next;
+
+        value = CFDictionaryGetValue(attrs, CFSTR("MinimumRefreshRate"));
+        if (!value || CFGetTypeID(value) != CFNumberGetTypeID() ||
+            !CFNumberGetValue(value, kCFNumberSInt32Type, &min_rate))
+            goto next;
+
+        value = CFDictionaryGetValue(attrs, CFSTR("MaximumRefreshRate"));
+        if (!value || CFGetTypeID(value) != CFNumberGetTypeID() ||
+            !CFNumberGetValue(value, kCFNumberSInt32Type, &max_rate))
+            goto next;
+
+        if (min_rate < 1 || max_rate <= min_rate)
+            goto next;
+
+        *out_min = min_rate;
+        *out_max = max_rate;
+        ret = TRUE;
+
+next:
+        if (attrs)
+        {
+            CFRelease(attrs);
+            attrs = NULL;
+        }
+        IOObjectRelease(node);
+        if (ret)
+            break;
+    }
+    IOObjectRelease(iterator);
+    return ret;
+}
+
+
+/* One carrier per window, keyed by the window object, so repeated calls from the
+   presenting path attach exactly one carrier however many metal views the window
+   grows.  Entries are removed when the metal view hosting the carrier is
+   destroyed (wine_frame_rate_carrier_detach_from_view, called from
+   -[WineMetalView dealloc]); everything here runs on the main thread. */
+static NSMutableDictionary* wine_frame_rate_carriers(void)
+{
+    static NSMutableDictionary* carriers;
+    if (!carriers)
+        carriers = [[NSMutableDictionary alloc] init];
+    return carriers;
+}
+
+/* Key for the carrier associated with its WineMetalView, so the per-frame path
+   can find it without a dictionary lookup and the carrier can be stopped from
+   the view's -dealloc.  The association is never cleared once made: the carrier
+   is a handful of bytes and keeping it alive means no thread can be left holding
+   a freed object.  detach only stops the link and clears the verdict. */
+static char wine_frame_rate_carrier_key;
+
+/* At most one declaration request in flight; see macdrv_declare_frame_rate_range. */
+static volatile int wine_frame_rate_declaration_pending;
+
+
+/* The carrier.  One object per window; it holds the carrier layer, the display
+   link that presents it, and the range that was declared. */
+@interface WineFrameRateRangeCarrier : NSObject <CAMetalDisplayLinkDelegate>
+{
+    CAMetalLayer* _carrier_layer;       /* 1x1, non-opaque, sublayer of the metal view */
+    CAMetalDisplayLink* _link;          /* presents _carrier_layer's own drawable */
+    id<MTLDevice> _device;
+    id<MTLCommandQueue> _queue;
+    uint32_t _range_min, _range_max;
+    CGDirectDisplayID _declared_for_display;
+    BOOL _declared;
+    BOOL _decided;                      /* reached a terminal verdict: armed, or declined */
+}
+
+    - (BOOL) armForView:(NSView*)metalView;
+    - (BOOL) decided;
+    - (void) forgetDecision;
+    - (void) invalidate;
+    - (void) detach;
+
+@end
+
+
+@implementation WineFrameRateRangeCarrier
+
+    - (void) dealloc
+    {
+        [self detach];
+        [super dealloc];
+    }
+
+    /* CAMetalDisplayLinkDelegate.  Runs on the run loop the link was added to
+       (the main run loop), once per display refresh.
+
+       This callback presents the CARRIER's own drawable and nothing else -- that
+       is the whole point: the panel follows presentation cadence, not a declared
+       range.  It deliberately does not retain the presenting layer, the game's
+       drawables or the host view: no path from here reaches D3DMetal's layer.
+       The drawable comes from the update, never from -nextDrawable, because a
+       CAMetalDisplayLink owns its layer's drawables (see the file comment). */
+    - (void) metalDisplayLink:(CAMetalDisplayLink*)link needsUpdate:(CAMetalDisplayLinkUpdate*)update
+    {
+        id<CAMetalDrawable> drawable = update.drawable;
+        id<MTLCommandBuffer> command_buffer;
+        MTLRenderPassDescriptor* pass;
+        id<MTLRenderCommandEncoder> encoder;
+
+        if (!drawable || !_queue)       /* no drawable: skip silently */
+            return;
+
+        /* Belt and braces on the one invariant that matters: the drawable being
+           presented belongs to the CARRIER's layer, never to D3DMetal's.  A
+           mismatch means the link is bound to the wrong layer, and presenting
+           through it would be the failure this design exists to avoid. */
+        if (drawable.layer != _carrier_layer)
+            return;
+
+        command_buffer = [_queue commandBuffer];
+        if (!command_buffer)
+            return;
+
+        /* As cheap as a present can be: a 1x1 clear, stored, committed. */
+        pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        pass.colorAttachments[0].texture = drawable.texture;
+        pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+        pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+
+        encoder = [command_buffer renderCommandEncoderWithDescriptor:pass];
+        [encoder endEncoding];
+
+        [command_buffer commit];
+        [drawable present];
+    }
+
+    /* Arm the carrier for the metal view, if it is not armed already.  Must run
+       on the main thread.  Returns TRUE once the link is live. */
+    - (BOOL) armForView:(NSView*)metalView
+    {
+        uint32_t min_rate = 0, max_rate = 0;
+        CGDirectDisplayID display_id = CGMainDisplayID();
+        CALayer* host_layer;
+        CAMetalDisplayLink* link;
+        double preferred;
+
+        if (_link)
+        {
+            if (_declared_for_display == display_id)
+            {
+                /* Same display as the live link: keep it, just restore the
+                   verdict that forgetDecision cleared. */
+                _declared = YES;
+                _decided = YES;
+                return YES;
+            }
+            /* The window moved to a different display: drop everything and
+               re-arm against the new one's range. */
+            [self invalidate];
+        }
+
+        /* CAMetalDisplayLink is macOS 14+.  The driver targets minos 15, so this
+           is unreachable in practice, but be correct about it. */
+        if (@available(macOS 14.0, *))
+            ;
+        else
+        {
+            NSLog(@"winemac: CAMetalDisplayLink requires macOS 14 or later; "
+                  "no frame-rate range declared");
+            _decided = YES;
+            return NO;
+        }
+
+        if (!wine_get_display_vrr_range(display_id, &min_rate, &max_rate))
+        {
+            NSLog(@"winemac: display %u advertises no variable refresh range; "
+                  "no frame-rate range declared", (unsigned)display_id);
+            _decided = YES;
+            return NO;
+        }
+
+        host_layer = [metalView layer];
+        if (!host_layer)
+        {
+            NSLog(@"winemac: this window's metal view has no layer; "
+                  "no frame-rate range declared");
+            _decided = YES;
+            return NO;
+        }
+
+        /* The carrier must never be the layer D3DMetal presents through: a
+           CAMetalDisplayLink owns its layer's drawables, and D3DMetal presents
+           via -nextDrawable, which raises CAMetalLayerInvalidOperation on such a
+           layer.  Structural guard: `metalView` is the WineMetalView, and the
+           view backing layer D3DMetal presents through belongs to it.  If this
+           ever stopped holding, the carrier below would be added somewhere else
+           and the game's layer left alone -- but the guard makes the assumption
+           explicit rather than silent. */
+        if (![metalView isKindOfClass:NSClassFromString(@"WineMetalView")])
+        {
+            NSLog(@"winemac: the frame-rate carrier's host is not a WineMetalView; "
+                  "no frame-rate range declared");
+            _decided = YES;
+            return NO;
+        }
+
+        _device = (id<MTLDevice>)MTLCreateSystemDefaultDevice();
+        if (_device)
+            _queue = [_device newCommandQueue];
+
+        _carrier_layer = [[CAMetalLayer alloc] init];
+        if (!_device || !_queue || !_carrier_layer)
+        {
+            NSLog(@"winemac: could not create the frame-rate carrier (layer, device "
+                  "or command queue); no frame-rate range declared");
+            [self invalidate];
+            _decided = YES;
+            return NO;
+        }
+
+        _carrier_layer.device = _device;
+        _carrier_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        _carrier_layer.framebufferOnly = YES;
+        _carrier_layer.opaque = NO;
+        _carrier_layer.contentsScale = 1.0;
+        _carrier_layer.frame = CGRectMake(0.0, 0.0, 1.0, 1.0);
+        _carrier_layer.autoresizingMask = kCALayerNotSizable;
+
+        /* A sublayer of the metal view's layer.  Same layer OBJECT as the
+           presenting layer only in being its child -- a distinct CALayer, so it
+           is not the layer D3DMetal calls -nextDrawable on.  No animation on
+           insertion, or the carrier would slide into place. */
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        [host_layer addSublayer:_carrier_layer];
+        [CATransaction commit];
+
+        _range_min = min_rate;
+        _range_max = max_rate;
+        _declared_for_display = display_id;
+
+        /* The user's cadence, clamped into the range the display advertises (a
+           preferred rate outside [min,max] raises NSInvalidArgumentException).
+           With no override, the display's minimum: a deliberate "as variable as
+           this display permits" rather than a guess at the game's cadence. */
+        preferred = 0.0;
+        {
+            const char* pref = getenv("WHISKY_DECLARE_FRAME_RATE_PREFERRED");
+
+            if (pref && pref[0])
+            {
+                preferred = atof(pref);
+                if (preferred > 0.0)
+                {
+                    if (preferred < _range_min) preferred = _range_min;
+                    if (preferred > _range_max) preferred = _range_max;
+                }
+                else
+                {
+                    preferred = 0.0;
+                }
+            }
+            if (preferred <= 0.0)
+                preferred = _range_min;
+        }
+
+        link = [[CAMetalDisplayLink alloc] initWithMetalLayer:_carrier_layer];
+        if (!link)
+        {
+            NSLog(@"winemac: could not create the carrier's CAMetalDisplayLink; "
+                  "no frame-rate range declared");
+            [self invalidate];
+            _decided = YES;
+            return NO;
+        }
+
+        link.preferredFrameRateRange = CAFrameRateRangeMake(_range_min, _range_max, preferred);
+        link.delegate = self;
+        /* Common modes only.  NSRunLoopCommonModes is a SET of modes that already
+           includes the default mode, so registering for NSDefaultRunLoopMode as
+           well would put the same source in the default mode twice and fire the
+           callback twice per refresh. */
+        [link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+        _link = link;
+        _declared = YES;
+        _decided = YES;
+
+        NSLog(@"winemac: declaring display %u frame-rate range %u..%u Hz with "
+              "preferred %.0f Hz via a 1x1 carrier CAMetalLayer whose "
+              "CAMetalDisplayLink PRESENTS its own drawable every frame "
+              "(WHISKY_DECLARE_FRAME_RATE_RANGE=1)",
+              (unsigned)display_id, _range_min, _range_max, preferred);
+        return YES;
+    }
+
+    /* Whether this carrier has reached a terminal verdict for its window: armed,
+       or declined.  Until it has, the declaring path keeps asking. */
+    - (BOOL) decided
+    {
+        return _declared || _decided;
+    }
+
+    /* Drop the verdict, without disturbing a working link: called on the main
+       thread when the display configuration changes.  The next frame finds no
+       verdict, asks for one, and armForView keeps the existing link if the window
+       is still on the display it was declared for -- so an unrelated display
+       change does not interrupt the carrier's presentation. */
+    - (void) forgetDecision
+    {
+        _decided = NO;
+        _declared = NO;
+    }
+
+    /* Stop the carrier for good: this view is going away, so the carrier's
+       presentation must stop.  Called from -[WineMetalView dealloc] on the main
+       thread.  Deliberately does NOT clear the associated object: that association
+       is what keeps this object alive for any other thread that may be inside
+       macdrv_declare_frame_rate_range at this instant (it holds a borrowed
+       reference out of the lookup).  The carrier is small and there is one per
+       window, so leaving it associated costs nothing and removes the race
+       entirely; the link and its layer are released here regardless. */
+    - (void) detach
+    {
+        _decided = YES;         /* stop the declaring path asking any more */
+        [self invalidate];
+    }
+
+    /* Tear the presentation down: the link first (so nothing is presenting and
+       nothing still owns the layer), then the layer, then the device and queue.
+       The carrier itself stays alive and can be re-armed from scratch afterwards,
+       because CAMetalDisplayLink cannot be reused once invalidated. */
+    - (void) invalidate
+    {
+        if (_link)
+        {
+            if (_link.delegate)
+                _link.delegate = nil;
+            [_link invalidate];     /* also removes the run loop source */
+            [_link release];
+            _link = nil;
+        }
+        if (_carrier_layer)
+        {
+            [CATransaction begin];
+            [CATransaction setDisableActions:YES];
+            [_carrier_layer removeFromSuperlayer];
+            [CATransaction commit];
+            [_carrier_layer release];
+            _carrier_layer = nil;
+        }
+        if (_queue)
+        {
+            [_queue release];
+            _queue = nil;
+        }
+        if (_device)
+        {
+            [_device release];
+            _device = nil;
+        }
+        _declared = NO;
+    }
+
+@end
+
+
+/***********************************************************************
+ *              wine_frame_rate_declare_on_main_thread
+ *
+ * The actual declaration, main thread only.  Called from
+ * macdrv_declare_frame_rate_range below.
+ */
+static void wine_frame_rate_observe_display_changes(void);
+
+static void wine_frame_rate_declare_on_main_thread(NSView* view)
+{
+    NSWindow* window;
+    NSNumber* key;
+    WineFrameRateRangeCarrier* carrier;
+
+    wine_frame_rate_observe_display_changes();
+
+    window = [view window];
+    if (!window || ![window contentView])
+        return;
+
+    /* Only for this driver's own windows. */
+    if (![[window contentView] isKindOfClass:NSClassFromString(@"WineContentView")])
+        return;
+
+    key = [NSNumber numberWithUnsignedLongLong:(unsigned long long)window];
+    carrier = wine_frame_rate_carriers()[key];
+    if (!carrier)
+    {
+        carrier = [[[WineFrameRateRangeCarrier alloc] init] autorelease];
+        wine_frame_rate_carriers()[key] = carrier;
+        objc_setAssociatedObject(view, &wine_frame_rate_carrier_key, carrier,
+                                 OBJC_ASSOCIATION_RETAIN);
+    }
+
+    /* The carrier may already have a verdict (armed, or declined because the
+       display advertises no variable-refresh range).  Either way the per-frame
+       path stops asking now: the verdict lives on the carrier, not on a shared
+       marker, so windows on different displays do not fight over it. */
+    if (![carrier decided])
+        [carrier armForView:view];
+}
+
+
+/***********************************************************************
+ *              wine_frame_rate_observe_display_changes
+ *
+ * Drops every carrier's verdict when the display configuration changes, so a
+ * window that moved to (or was opened on) a display with a variable-refresh
+ * range gets its declaration then, and a window whose display went away is
+ * re-evaluated against whatever is there now.  Registered once, lazily, on the
+ * main thread.  Main thread only.
+ */
+static void wine_frame_rate_observe_display_changes(void)
+{
+    static BOOL registered;
+
+    if (registered)
+        return;
+    registered = YES;
+
+    [[NSNotificationCenter defaultCenter]
+        addObserverForName:WineDisplayConfigurationChangedNotification
+                    object:nil
+                     queue:[NSOperationQueue mainQueue]
+                usingBlock:^(NSNotification* note) {
+        for (WineFrameRateRangeCarrier* carrier in [wine_frame_rate_carriers() allValues])
+            [carrier forgetDecision];
+    }];
+}
+
+
+/***********************************************************************
+ *              wine_frame_rate_carrier_detach_from_view
+ *
+ * Drop the carrier belonging to this metal view -- called from
+ * -[WineMetalView dealloc], which is the end of the carrier's life: the view
+ * owns the layer the carrier was added to.  Main thread only.
+ */
+static void wine_frame_rate_carrier_detach_from_view(NSView* view)
+{
+    WineFrameRateRangeCarrier* carrier;
+
+    if (!view)
+        return;
+
+    carrier = (WineFrameRateRangeCarrier*)objc_getAssociatedObject(view, &wine_frame_rate_carrier_key);
+    if (!carrier)
+        return;
+
+    [carrier detach];
+    objc_setAssociatedObject(view, &wine_frame_rate_carrier_key, nil, OBJC_ASSOCIATION_RETAIN);
+}
+
+
+/***********************************************************************
+ *              macdrv_declare_frame_rate_range
+ *
+ * OPT-IN, off unless WHISKY_DECLARE_FRAME_RATE_RANGE=1.
+ *
+ * Declares a frame-rate cadence to the compositor for the window this view
+ * belongs to, by arming a 1x1 carrier CAMetalLayer sublayer with a
+ * CAMetalDisplayLink that presents its own drawable.  `view` is the D3DMetal
+ * metal view (the view backing the CAMetalLayer D3DMetal presents through);
+ * called from -[WineMetalLayer nextDrawable], i.e. only for windows that are
+ * actually presenting D3DMetal content.
+ *
+ * The declared range is the DISPLAY's own variable-refresh range, read at
+ * runtime from the IORegistry (wine_get_display_vrr_range above), never
+ * hardcoded and never taken from any particular game.
+ *
+ * With the environment variable unset this returns before doing anything at
+ * all -- no layer, no link, no run loop source, nothing allocated -- so the
+ * driver's behaviour is exactly the old behaviour.
+ *
+ * The declaration itself is made on the main thread (it creates a layer and a
+ * run loop source), asynchronously, so it never blocks D3DMetal's presenting
+ * path.  Once the carrier for a given view has a verdict, subsequent calls cost a
+ * getenv, one associated-object lookup and a flag test.
+ */
+void macdrv_declare_frame_rate_range(NSView* view)
+{
+    const char* enabled = getenv("WHISKY_DECLARE_FRAME_RATE_RANGE");
+    WineFrameRateRangeCarrier* carrier;
+
+    if (!enabled || enabled[0] != '1')
+        return;
+
+    if (!view)
+        return;
+
+    /* Read-only on the presenting thread: an associated-object lookup is a hash
+       probe, and -decided is a flag test.  Until the carrier has a verdict, ask
+       the main thread to make one. */
+    carrier = (WineFrameRateRangeCarrier*)objc_getAssociatedObject(view, &wine_frame_rate_carrier_key);
+    if (carrier && [carrier decided])
+        return;                             /* armed or declined already: nothing to do */
+
+    if ([NSThread isMainThread])
+    {
+        wine_frame_rate_declare_on_main_thread(view);
+        return;
+    }
+
+    /* At most one declaration in flight, so a burst of presents before the main
+       thread services the request does not queue a stack of duplicates.  This is
+       a benign race (two threads could both pass the test and queue two blocks;
+       the second runs against an already-decided carrier and does nothing).
+       The block clears the flag rather than the caller, so a stale read can only
+       cost one dropped dispatch -- the next present retries -- and never leaves
+       the flag set with no request outstanding. */
+    if (wine_frame_rate_declaration_pending)
+        return;
+    wine_frame_rate_declaration_pending = 1;
+
+    /* OnMainThreadAsync copies the block, and copying retains the captured view,
+       so the view cannot go away underneath this.  The call is asynchronous on
+       purpose: -nextDrawable is on D3DMetal's presenting path and must not block
+       on the main thread. */
+    OnMainThreadAsync(^{
+        wine_frame_rate_declaration_pending = 0;
+        wine_frame_rate_declare_on_main_thread(view);
+    });
+}
+
+
 
 
 #ifndef MAC_OS_X_VERSION_10_14
@@ -1035,6 +1766,9 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
     - (void) dealloc
     {
+        /* OPT-IN frame-rate carrier: drop the carrier this view hosted, before
+           the backing layer (which the carrier is a sublayer of) goes away. */
+        wine_frame_rate_carrier_detach_from_view(self);
         [_device release];
         [super dealloc];
     }

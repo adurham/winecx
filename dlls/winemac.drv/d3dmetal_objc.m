@@ -64,6 +64,18 @@
                     [queue postEvent:event];
                     macdrv_release_event(event);
                 }
+
+                /* OPT-IN WHISKY_DECLARE_FRAME_RATE_RANGE=1: make the compositor
+                 * follow the cadence this window's content is produced at, by
+                 * arming a 1x1 carrier CAMetalLayer (a sublayer of this view's
+                 * layer) with a CAMetalDisplayLink that presents the carrier's
+                 * own drawable.  The panel follows presentation cadence, not a
+                 * declaration, which is why the old CADisplayLink approach did
+                 * nothing here.  This is the one place that reliably identifies
+                 * "a window presenting D3DMetal content"; the function returns
+                 * immediately when the variable is unset.  It never touches this
+                 * layer or nextDrawable. */
+                macdrv_declare_frame_rate_range(view);
             }
         }
 
