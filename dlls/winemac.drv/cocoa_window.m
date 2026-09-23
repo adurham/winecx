@@ -369,8 +369,17 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
  *   previous shape here and it is why it was replaced.
  * - A CAMetalDisplayLink whose callback actually PRESENTS a drawable DOES move
  *   the panel (measured 48-240 Hz movement).
- * - The same link with a no-op callback does not move it.  The panel follows
- *   PRESENTATION CADENCE, not a declared range.
+ * - The same link with a no-op callback does not move it.
+ *
+ * CORRECTION 2026-09-23 (later the same day, controlled A/B): an earlier version
+ * of this comment concluded "the panel follows PRESENTATION CADENCE, not a
+ * declared range".  THAT IS WRONG and was the source of a bad design.  A pure
+ * 60fps present stream with NO display link and NO declaration leaves the panel at
+ * 240 Hz -- delivery alone does nothing.  What the panel follows is the DECLARED
+ * RANGE, and specifically its MAXIMUM, which acts as a permission: see "THE RANGE"
+ * below.  The link matters because only a link bound to the PRESENTING layer is
+ * listened to at all; a declaration on the NSWindow or the NSScreen is ignored
+ * (measured -- identical 48..60 range on either left the panel at 240).
  *
  * WHY THE LINK CANNOT GO ON THE GAME'S OWN LAYER
  *
@@ -434,8 +443,36 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
  *
  * THE RANGE
  *
- * The display's OWN variable-refresh range, read from the system at runtime.
- * Not hardcoded, and never taken from any particular game's frame rate.
+ * READ THIS BEFORE CHANGING IT -- the original reasoning here was wrong and cost
+ * a day.
+ *
+ * This code used to declare the DISPLAY's own variable-refresh range (48..240 on
+ * the AW3425DW, read from the IORegistry), on the stated principle that it was
+ * "never taken from any particular game's frame rate".  That is exactly backwards,
+ * and it is why this feature cannot follow a game.
+ *
+ * Measured 2026-09-23 (controlled A/B, monitor OSD as the instrument -- see
+ * ~/whisky-gptk-writeup/VRR-MACOS-SEMANTICS-20260923.md):
+ *
+ *   - On macOS the panel rate is WindowServer's decision.  Everything is
+ *     composited; there is no Windows-style flip-model scanout bypass, so an
+ *     app's delivered present stream never drives panel timing directly.
+ *   - A declared range's MAXIMUM IS A PERMISSION, NOT A BOUND.  Declaring 48..240
+ *     tells WindowServer "240 is acceptable for this content", and it will take
+ *     240 whenever its policy prefers.  Declaring 48..60 withdraws that
+ *     permission, and the panel drops to ~60 and varies within it.
+ *   - Verified in a controlled A/B: identical binary, range, preferred rate and
+ *     stream; on the display's VRR mode twin the panel varied 55-65 Hz, and on the
+ *     non-VRR twin it stayed flat at 240 Hz.
+ *
+ * Therefore the range MUST track the game's cadence, and must be RETUNED as that
+ * cadence changes -- the same pattern AVKit uses for video frame matching.  A
+ * fixed range taken from the display can never follow a 60fps game; declaring
+ * 48..240 is precisely the shape that sits at 240 and ignores the game entirely.
+ *
+ * The display's own range is still the right thing to read, but as the CLAMP for
+ * the declared values (and to reject displays with no VRR range at all) -- not as
+ * the declaration itself.
  *
  * NSScreen.minimumRefreshInterval / maximumRefreshInterval are NOT usable here:
  * on the AW3425DW both report the current mode's period (240 Hz / 240 Hz), i.e.
