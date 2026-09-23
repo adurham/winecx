@@ -407,6 +407,31 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
  * The function is called from -[WineMetalLayer nextDrawable], which is the one
  * place that reliably identifies "this window is presenting D3DMetal content".
  *
+ * THE PRESENT GATE
+ *
+ * The link is handed an update at the DISPLAY's rate, not the game's, so a
+ * carrier that presents on every update FREE-RUNS -- up to 240/s on this panel
+ * -- and the panel follows the carrier rather than the game: two presenters at
+ * different rates fighting.  Measured in the standalone probe: a 60/s game with
+ * a free-running carrier presenting 60.6/s against it.
+ *
+ * So the carrier presents ONLY IF the game has produced a new frame since its
+ * last callback.  The game's cadence comes from the path that is already
+ * per-frame: this function is called from -[WineMetalLayer nextDrawable] on
+ * every present, and that call also bumps an atomic counter on the carrier
+ * (-noteGamePresent).  The callback compares the counter against the value it
+ * last acted on and returns without presenting when it has not moved -- no
+ * drawable, no command buffer, no GPU work, nothing logged.  Then the display
+ * sees new content at exactly the game's cadence and the carrier injects no
+ * presents of its own.  Validated in the probe: 58.8/s against a 60/s game and
+ * 49.6/s against a 50/s game, i.e. it tracks the game
+ * (~/whisky-gptk-writeup/scripts/frr_seq5.m, the reference implementation).
+ *
+ * A game that stalls presents nothing, so the carrier carries nothing and the
+ * panel may sit at its minimum rate until the game presents again.  That is
+ * correct -- the game is not presenting -- and there is deliberately no timer
+ * or heartbeat added to mask it.
+ *
  * THE RANGE
  *
  * The display's OWN variable-refresh range, read from the system at runtime.
@@ -607,6 +632,8 @@ static volatile int wine_frame_rate_declaration_pending;
     CGDirectDisplayID _declared_for_display;
     BOOL _declared;
     BOOL _decided;                      /* reached a terminal verdict: armed, or declined */
+    unsigned long _game_presents;       /* the game's presents, bumped by -noteGamePresent */
+    unsigned long _carrier_seen;        /* _game_presents as of the last callback that acted */
 }
 
     - (BOOL) armForView:(NSView*)metalView;
@@ -614,6 +641,7 @@ static volatile int wine_frame_rate_declaration_pending;
     - (void) forgetDecision;
     - (void) invalidate;
     - (void) detach;
+    - (void) noteGamePresent;
 
 @end
 
@@ -626,6 +654,15 @@ static volatile int wine_frame_rate_declaration_pending;
         [super dealloc];
     }
 
+    /* The game produced a frame.  -[WineMetalLayer nextDrawable] calls this from
+       D3DMetal's presenting thread, so the bump is atomic and lock-free; the
+       callback that reads it runs on the main run loop.  Nothing is logged
+       here, and nothing is logged about it per frame. */
+    - (void) noteGamePresent
+    {
+        __atomic_fetch_add(&_game_presents, 1, __ATOMIC_SEQ_CST);
+    }
+
     /* CAMetalDisplayLinkDelegate.  Runs on the run loop the link was added to
        (the main run loop), once per display refresh.
 
@@ -634,13 +671,48 @@ static volatile int wine_frame_rate_declaration_pending;
        range.  It deliberately does not retain the presenting layer, the game's
        drawables or the host view: no path from here reaches D3DMetal's layer.
        The drawable comes from the update, never from -nextDrawable, because a
-       CAMetalDisplayLink owns its layer's drawables (see the file comment). */
+       CAMetalDisplayLink owns its layer's drawables (see the file comment).
+
+       THE GATE.  The link is handed an update at the DISPLAY's rate, which is
+       usually faster than the game produces frames, so a carrier that presents
+       on every update free-runs -- up to 240/s on this panel -- and the panel
+       then follows the CARRIER's cadence instead of the game's: two presenters
+       at different rates, which is why the user reports the panel not being in
+       sync and erratic Metal HUD frame timings.  So present ONLY when the game
+       has produced a new frame since the last time this ran.  The display then
+       sees new content at exactly the game's cadence, never faster, and the
+       carrier injects no presents of its own.
+
+       When the game has not advanced this returns immediately: no drawable is
+       touched, no command buffer, no encoder, no GPU work, nothing logged.  A
+       game that stalls (a loading screen, a cutscene) therefore carries nothing
+       and the panel is free to sit at its minimum rate until the game presents
+       again; that is correct -- the game is not presenting -- and there is
+       deliberately no timer or heartbeat to paper over it.
+
+       Measured against the reference implementation of this gate
+       (~/whisky-gptk-writeup/scripts/frr_seq5.m): a free-running carrier
+       presented 60.6/s against a 60/s game; gated, 58.8/s against a 60/s game
+       and 49.6/s against a 50/s game -- i.e. it tracks the game. */
     - (void) metalDisplayLink:(CAMetalDisplayLink*)link needsUpdate:(CAMetalDisplayLinkUpdate*)update
     {
-        id<CAMetalDrawable> drawable = update.drawable;
+        unsigned long produced;
+        id<CAMetalDrawable> drawable;
         id<MTLCommandBuffer> command_buffer;
         MTLRenderPassDescriptor* pass;
         id<MTLRenderCommandEncoder> encoder;
+
+        /* THE GATE, before anything else -- the update is not even read:
+           present only if the game has produced a new frame since our last
+           callback.  Consuming the count here, exactly as the reference
+           implementation does, means at most one carrier present per game
+           present. */
+        produced = __atomic_load_n(&_game_presents, __ATOMIC_SEQ_CST);
+        if (produced == _carrier_seen)
+            return;                     /* the game did not advance: present nothing */
+        _carrier_seen = produced;
+
+        drawable = update.drawable;
 
         if (!drawable || !_queue)       /* no drawable: skip silently */
             return;
@@ -800,6 +872,12 @@ static volatile int wine_frame_rate_declaration_pending;
                 preferred = _range_min;
         }
 
+        /* Baseline for the gate: whatever the game has produced so far is
+           already on screen, so the first callback after arming carries nothing
+           and returns; from then on the carrier presents exactly when the game
+           does.  Same starting point the probe takes. */
+        _carrier_seen = __atomic_load_n(&_game_presents, __ATOMIC_SEQ_CST);
+
         link = [[CAMetalDisplayLink alloc] initWithMetalLayer:_carrier_layer];
         if (!link)
         {
@@ -930,9 +1008,17 @@ static void wine_frame_rate_declare_on_main_thread(NSView* view)
     {
         carrier = [[[WineFrameRateRangeCarrier alloc] init] autorelease];
         wine_frame_rate_carriers()[key] = carrier;
+    }
+
+    /* Associate this view with the carrier whether or not it created it.  The
+       carrier's present gate counts the presents of every metal view associated
+       with it (-noteGamePresent is reached by that association), so a window
+       that grows a second metal view counts that view's presents too rather
+       than the gate never seeing a frame.  Re-setting the same object is a
+       no-op. */
+    if (objc_getAssociatedObject(view, &wine_frame_rate_carrier_key) != (id)carrier)
         objc_setAssociatedObject(view, &wine_frame_rate_carrier_key, carrier,
                                  OBJC_ASSOCIATION_RETAIN);
-    }
 
     /* The carrier may already have a verdict (armed, or declined because the
        display advertises no variable-refresh range).  Either way the per-frame
@@ -1017,7 +1103,10 @@ static void wine_frame_rate_carrier_detach_from_view(NSView* view)
  * The declaration itself is made on the main thread (it creates a layer and a
  * run loop source), asynchronously, so it never blocks D3DMetal's presenting
  * path.  Once the carrier for a given view has a verdict, subsequent calls cost a
- * getenv, one associated-object lookup and a flag test.
+ * getenv, one associated-object lookup, one atomic increment of the carrier's
+ * present counter (see THE GATE: the carrier presents only when the game has
+ * produced a new frame, so its callback needs to know when one arrives) and a
+ * flag test.
  */
 void macdrv_declare_frame_rate_range(NSView* view)
 {
@@ -1030,12 +1119,21 @@ void macdrv_declare_frame_rate_range(NSView* view)
     if (!view)
         return;
 
-    /* Read-only on the presenting thread: an associated-object lookup is a hash
-       probe, and -decided is a flag test.  Until the carrier has a verdict, ask
-       the main thread to make one. */
+    /* On the presenting thread this is an associated-object lookup (a hash
+       probe), one atomic increment of the carrier's present counter, and a flag
+       test.  Until the carrier has a verdict, ask the main thread to make one. */
     carrier = (WineFrameRateRangeCarrier*)objc_getAssociatedObject(view, &wine_frame_rate_carrier_key);
-    if (carrier && [carrier decided])
-        return;                             /* armed or declined already: nothing to do */
+    if (carrier)
+    {
+        /* This call IS the game's present moment -- it runs from
+           -[WineMetalLayer nextDrawable], once per frame the game produces --
+           so it is what the carrier's callback gates on.  See THE GATE in
+           -metalDisplayLink:needsUpdate: above. */
+        [carrier noteGamePresent];
+
+        if ([carrier decided])
+            return;                         /* armed or declined already: nothing to do */
+    }
 
     if ([NSThread isMainThread])
     {

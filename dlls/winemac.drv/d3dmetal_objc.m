@@ -74,7 +74,13 @@
                  * nothing here.  This is the one place that reliably identifies
                  * "a window presenting D3DMetal content"; the function returns
                  * immediately when the variable is unset.  It never touches this
-                 * layer or nextDrawable. */
+                 * layer or nextDrawable.
+                 *
+                 * This call is also the GAME'S PRESENT MOMENT: it bumps the
+                 * carrier's atomic present counter, which is what the carrier's
+                 * CAMetalDisplayLink callback gates on, so the carrier presents
+                 * only when the game has produced a new frame instead of
+                 * free-running at the display's rate. */
                 macdrv_declare_frame_rate_range(view);
             }
         }

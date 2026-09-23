@@ -39,6 +39,13 @@
  * -[WineMetalLayer nextDrawable], which is the one place that reliably
  * identifies "this window is presenting through a D3DMetal CAMetalLayer".
  *
+ * The carrier does NOT free-run: the link is handed an update at the DISPLAY's
+ * rate, so presenting on every update would make the panel follow the carrier
+ * (up to 240/s here) instead of the game.  The callback presents only when the
+ * game produced a new frame since its last callback -- the call site below is
+ * also the game's present moment, and it bumps an atomic counter the callback
+ * compares against.  See THE PRESENT GATE in cocoa_window.m.
+ *
  * Set WHISKY_DECLARE_FRAME_RATE_RANGE=1 to enable and
  * WHISKY_DECLARE_FRAME_RATE_PREFERRED=<hz> for the game's cadence.  Default off:
  * with the variable unset this returns immediately, allocating nothing, and the
