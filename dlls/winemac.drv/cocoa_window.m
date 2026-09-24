@@ -653,16 +653,34 @@ static NSMutableDictionary* wine_frame_rate_carriers(void)
    a freed object.  detach only stops the link and clears the verdict. */
 static char wine_frame_rate_carrier_key;
 
+
+/* TEMPORARY DIAGNOSTIC (rig only, WHISKY_BROKER_DIAG=1). */
+static void wine_broker_diag_w(const char* fmt, ...)
+{
+    static int enabled = -1;
+    FILE* f; va_list ap;
+    if (enabled < 0) enabled = getenv("WHISKY_BROKER_DIAG") ? 1 : 0;
+    if (!enabled) return;
+    f = fopen("/tmp/broker-diag.log", "a");
+    if (!f) return;
+    va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
+    fputc('\n', f); fclose(f);
+}
+
 /* At most one declaration request in flight; see macdrv_declare_frame_rate_range. */
 static volatile int wine_frame_rate_declaration_pending;
 
 
-/* The carrier.  One object per window; it holds the carrier layer, the display
-   link that presents it, and the range that was declared. */
+/* The frame-rate broker.  One object per window.  In broker mode it owns the
+   CAMetalDisplayLink bound to the layer that presents the visible content, and
+   blits D3DMetal's latest frame (from the offscreen WineMetalLayer) into that
+   layer's drawables once per tick.  See the file comment above for why the
+   presentation must never be skipped, and why the game's own layer is offscreen. */
 @interface WineFrameRateRangeCarrier : NSObject <CAMetalDisplayLinkDelegate>
 {
-    CAMetalLayer* _carrier_layer;       /* 1x1, non-opaque, sublayer of the metal view */
-    CAMetalDisplayLink* _link;          /* presents _carrier_layer's own drawable */
+    CAMetalLayer* _presenting_layer;    /* the layer the link owns and presents */
+    WineMetalLayer* _game_layer;        /* D3DMetal's offscreen WineMetalLayer (not retained) */
+    CAMetalDisplayLink* _link;
     id<MTLDevice> _device;
     id<MTLCommandQueue> _queue;
     uint32_t _range_min, _range_max;
@@ -670,7 +688,8 @@ static volatile int wine_frame_rate_declaration_pending;
     BOOL _declared;
     BOOL _decided;                      /* reached a terminal verdict: armed, or declined */
     unsigned long _game_presents;       /* the game's presents, bumped by -noteGamePresent */
-    unsigned long _carrier_seen;        /* _game_presents as of the last callback that acted */
+    unsigned long _carrier_seen;        /* _game_presents as of the last frame the broker saw */
+    unsigned long _presents;            /* draws the broker has presented (diagnostics) */
 }
 
     - (BOOL) armForView:(NSView*)metalView;
@@ -703,80 +722,100 @@ static volatile int wine_frame_rate_declaration_pending;
     /* CAMetalDisplayLinkDelegate.  Runs on the run loop the link was added to
        (the main run loop), once per display refresh.
 
-       This callback presents the CARRIER's own drawable and nothing else -- that
-       is the whole point: the panel follows presentation cadence, not a declared
-       range.  It deliberately does not retain the presenting layer, the game's
-       drawables or the host view: no path from here reaches D3DMetal's layer.
-       The drawable comes from the update, never from -nextDrawable, because a
-       CAMetalDisplayLink owns its layer's drawables (see the file comment).
+       BROKER MODE.  The link owns the layer that PRESSES the visible content --
+       the only attachment point that has ever moved this panel -- and this
+       callback presents one of that layer's own drawables on EVERY tick,
+       without exception.  The game's frames arrive through a different door:
+       D3DMetal renders into an OFFSCREEN WineMetalLayer (outside the view
+       hierarchy, never composited) and its most recent drawable's texture is
+       BLITTED into the drawable being presented here.
 
-       THE GATE.  The link is handed an update at the DISPLAY's rate, which is
-       usually faster than the game produces frames, so a carrier that presents
-       on every update free-runs -- up to 240/s on this panel -- and the panel
-       then follows the CARRIER's cadence instead of the game's: two presenters
-       at different rates, which is why the user reports the panel not being in
-       sync and erratic Metal HUD frame timings.  So present ONLY when the game
-       has produced a new frame since the last time this ran.  The display then
-       sees new content at exactly the game's cadence, never faster, and the
-       carrier injects no presents of its own.
+       WHY IT MUST NEVER SKIP A PRESENT.  A CAMetalDisplayLink owns its layer's
+       drawable pool, and that pool is 3.  If a drawable is left unpresented the
+       link stops ticking as soon as the pool is exhausted, and it never
+       recovers on its own -- measured: three callbacks, then silence
+       indefinitely, with no nil drawable and no error to detect it by.
+       Presenting the held drawables resumes it, but only from an independent
+       clock (the callback it would need never arrives).  So the previous
+       design's gate -- "present only if the game advanced" -- was itself the
+       mechanism that froze the carrier: it skipped presents, exhausted the
+       pool, and killed the link.  Re-presenting the last frame is always
+       correct here; skipping is not.
 
-       When the game has not advanced this returns immediately: no drawable is
-       touched, no command buffer, no encoder, no GPU work, nothing logged.  A
-       game that stalls (a loading screen, a cutscene) therefore carries nothing
-       and the panel is free to sit at its minimum rate until the game presents
-       again; that is correct -- the game is not presenting -- and there is
-       deliberately no timer or heartbeat to paper over it.
-
-       Measured against the reference implementation of this gate
-       (~/whisky-gptk-writeup/scripts/frr_seq5.m): a free-running carrier
-       presented 60.6/s against a 60/s game; gated, 58.8/s against a 60/s game
-       and 49.6/s against a 50/s game -- i.e. it tracks the game. */
+       Nothing in this callback touches the game's layer or its drawables: the
+       blit reads -[WineMetalLayer wineLastAcquiredDrawable] (not retained) and
+       every use is guarded. */
     - (void) metalDisplayLink:(CAMetalDisplayLink*)link needsUpdate:(CAMetalDisplayLinkUpdate*)update
     {
         unsigned long produced;
         id<CAMetalDrawable> drawable;
+        id<CAMetalDrawable> game_drawable;
         id<MTLCommandBuffer> command_buffer;
         MTLRenderPassDescriptor* pass;
         id<MTLRenderCommandEncoder> encoder;
 
-        /* THE GATE, before anything else -- the update is not even read:
-           present only if the game has produced a new frame since our last
-           callback.  Consuming the count here, exactly as the reference
-           implementation does, means at most one carrier present per game
-           present. */
         produced = __atomic_load_n(&_game_presents, __ATOMIC_SEQ_CST);
-        if (produced == _carrier_seen)
-            return;                     /* the game did not advance: present nothing */
-        _carrier_seen = produced;
 
         drawable = update.drawable;
 
-        if (!drawable || !_queue)       /* no drawable: skip silently */
+        if (!drawable || !_queue)       /* no drawable: nothing we can legally present */
             return;
 
         /* Belt and braces on the one invariant that matters: the drawable being
-           presented belongs to the CARRIER's layer, never to D3DMetal's.  A
+           presented belongs to the layer the link owns, never to D3DMetal's.  A
            mismatch means the link is bound to the wrong layer, and presenting
            through it would be the failure this design exists to avoid. */
-        if (drawable.layer != _carrier_layer)
+        if (drawable.layer != _presenting_layer)
             return;
+
+        game_drawable = _game_layer ? [_game_layer wineLastAcquiredDrawable] : nil;
 
         command_buffer = [_queue commandBuffer];
         if (!command_buffer)
             return;
 
-        /* As cheap as a present can be: a 1x1 clear, stored, committed. */
-        pass = [MTLRenderPassDescriptor renderPassDescriptor];
-        pass.colorAttachments[0].texture = drawable.texture;
-        pass.colorAttachments[0].loadAction = MTLLoadActionClear;
-        pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
-        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        /* Clear the frame the compositor is about to show.  With a game frame
+           available this is followed by the blit; without one the previous
+           frame stays on screen only in the sense that the game has not
+           produced anything new, so the last blitted content is re-shown by
+           leaving the drawable's previous contents -- clearing to black here
+           would flash.  Therefore: when there is no game frame yet, present the
+           untouched drawable (an empty pass) rather than clearing it. */
+        if (game_drawable)
+        {
+            pass = [MTLRenderPassDescriptor renderPassDescriptor];
+            pass.colorAttachments[0].texture = drawable.texture;
+            pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+            pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
+            pass.colorAttachments[0].storeAction = MTLStoreActionStore;
 
-        encoder = [command_buffer renderCommandEncoderWithDescriptor:pass];
-        [encoder endEncoding];
+            encoder = [command_buffer renderCommandEncoderWithDescriptor:pass];
+            [encoder endEncoding];
+        }
 
+        if (game_drawable)
+        {
+            id<MTLTexture> src = game_drawable.texture;
+            id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
+            NSUInteger w = src.width  < drawable.texture.width  ? src.width  : drawable.texture.width;
+            NSUInteger h = src.height < drawable.texture.height ? src.height : drawable.texture.height;
+
+            [blit copyFromTexture:src
+                      sourceSlice:0 sourceLevel:0
+                     sourceOrigin:MTLOriginMake(0, 0, 0)
+                       sourceSize:MTLSizeMake(w, h, 1)
+                        toTexture:drawable.texture
+                 destinationSlice:0 destinationLevel:0
+                destinationOrigin:MTLOriginMake(0, 0, 0)];
+            [blit endEncoding];
+        }
+
+        [command_buffer presentDrawable:drawable];
         [command_buffer commit];
-        [drawable present];
+
+        _presents++;
+        if (produced != _carrier_seen)
+            _carrier_seen = produced;   /* bookkeeping only; the present above already happened */
     }
 
     /* Arm the carrier for the metal view, if it is not armed already.  Must run
@@ -824,26 +863,32 @@ static volatile int wine_frame_rate_declaration_pending;
             return NO;
         }
 
-        host_layer = [metalView layer];
-        if (!host_layer)
+        /* The layer the broker will own and present is the PRESENTATION view's
+           layer -- the one that shows content, and the only attachment point
+           ever measured to move this panel.  In broker mode the view D3DMetal
+           renders into is offscreen, so `metalView` here is the OFFSCREEN
+           surface; -winePresentationView resolves to its on-screen sibling.
+           The game's own presenting layer is resolved separately, below. */
+        wine_broker_diag_w("armForView: metalView=%p presentation=%p", (void*)metalView, (void*)[metalView winePresentationView]);
+        host_layer = [[metalView winePresentationView] layer];
+        if (!host_layer || ![host_layer isKindOfClass:[CAMetalLayer class]])
         {
-            NSLog(@"winemac: this window's metal view has no layer; "
+            NSLog(@"winemac: the presentation view has no CAMetalLayer; "
                   "no frame-rate range declared");
             _decided = YES;
             return NO;
         }
 
-        /* The carrier must never be the layer D3DMetal presents through: a
-           CAMetalDisplayLink owns its layer's drawables, and D3DMetal presents
-           via -nextDrawable, which raises CAMetalLayerInvalidOperation on such a
-           layer.  Structural guard: `metalView` is the WineMetalView, and the
-           view backing layer D3DMetal presents through belongs to it.  If this
-           ever stopped holding, the carrier below would be added somewhere else
-           and the game's layer left alone -- but the guard makes the assumption
-           explicit rather than silent. */
-        if (![metalView isKindOfClass:NSClassFromString(@"WineMetalView")])
+        wine_broker_diag_w("arm: host_layer=%p game_layer=%p same=%d vrr_range=%u..%u",
+                           (void*)host_layer, (void*)[metalView layer],
+                           host_layer == [metalView layer], min_rate, max_rate);
+        if (host_layer == [metalView layer])
         {
-            NSLog(@"winemac: the frame-rate carrier's host is not a WineMetalView; "
+            /* Not broker mode, or the pairing was lost: the layer we would own
+               is also the layer D3DMetal presents through, and a link on it
+               would make every -nextDrawable raise.  Decline rather than
+               break the game. */
+            NSLog(@"winemac: the presentation layer is the D3DMetal layer; "
                   "no frame-rate range declared");
             _decided = YES;
             return NO;
@@ -853,32 +898,20 @@ static volatile int wine_frame_rate_declaration_pending;
         if (_device)
             _queue = [_device newCommandQueue];
 
-        _carrier_layer = [[CAMetalLayer alloc] init];
-        if (!_device || !_queue || !_carrier_layer)
+        if (!_device || !_queue)
         {
-            NSLog(@"winemac: could not create the frame-rate carrier (layer, device "
-                  "or command queue); no frame-rate range declared");
+            NSLog(@"winemac: could not create the frame-rate broker (device or "
+                  "command queue); no frame-rate range declared");
             [self invalidate];
             _decided = YES;
             return NO;
         }
 
-        _carrier_layer.device = _device;
-        _carrier_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
-        _carrier_layer.framebufferOnly = YES;
-        _carrier_layer.opaque = NO;
-        _carrier_layer.contentsScale = 1.0;
-        _carrier_layer.frame = CGRectMake(0.0, 0.0, 1.0, 1.0);
-        _carrier_layer.autoresizingMask = kCALayerNotSizable;
-
-        /* A sublayer of the metal view's layer.  Same layer OBJECT as the
-           presenting layer only in being its child -- a distinct CALayer, so it
-           is not the layer D3DMetal calls -nextDrawable on.  No animation on
-           insertion, or the carrier would slide into place. */
-        [CATransaction begin];
-        [CATransaction setDisableActions:YES];
-        [host_layer addSublayer:_carrier_layer];
-        [CATransaction commit];
+        _presenting_layer = (CAMetalLayer*)host_layer;
+        _game_layer = (WineMetalLayer*)[metalView layer];    /* D3DMetal's, offscreen */
+        _presenting_layer.framebufferOnly = NO;              /* the broker blits INTO it */
+        _presenting_layer.device = _device;
+        _presenting_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
 
         _range_min = min_rate;
         _range_max = max_rate;
@@ -887,7 +920,10 @@ static volatile int wine_frame_rate_declaration_pending;
         /* The user's cadence, clamped into the range the display advertises (a
            preferred rate outside [min,max] raises NSInvalidArgumentException).
            With no override, the display's minimum: a deliberate "as variable as
-           this display permits" rather than a guess at the game's cadence. */
+           this display permits" rather than a guess at the game's cadence.
+           NOTE: this MUST come after _range_min/_range_max are set -- clamping
+           against a still-zero range silently rewrites any requested rate to 0,
+           and preferred == 0 means "use the maximum", i.e. 240. */
         preferred = 0.0;
         {
             const char* pref = getenv("WHISKY_DECLARE_FRAME_RATE_PREFERRED");
@@ -909,16 +945,15 @@ static volatile int wine_frame_rate_declaration_pending;
                 preferred = _range_min;
         }
 
-        /* Baseline for the gate: whatever the game has produced so far is
-           already on screen, so the first callback after arming carries nothing
-           and returns; from then on the carrier presents exactly when the game
-           does.  Same starting point the probe takes. */
+        /* Baseline for the game-present counter.  Kept for diagnostics: the
+           broker presents on every tick regardless, so nothing depends on it. */
         _carrier_seen = __atomic_load_n(&_game_presents, __ATOMIC_SEQ_CST);
 
-        link = [[CAMetalDisplayLink alloc] initWithMetalLayer:_carrier_layer];
+        wine_broker_diag_w("arm: creating link on presenting layer %p", (void*)_presenting_layer);
+        link = [[CAMetalDisplayLink alloc] initWithMetalLayer:_presenting_layer];
         if (!link)
         {
-            NSLog(@"winemac: could not create the carrier's CAMetalDisplayLink; "
+            NSLog(@"winemac: could not create the broker's CAMetalDisplayLink; "
                   "no frame-rate range declared");
             [self invalidate];
             _decided = YES;
@@ -935,11 +970,14 @@ static volatile int wine_frame_rate_declaration_pending;
         _link = link;
         _declared = YES;
         _decided = YES;
+        wine_broker_diag_w("ARMED: link live on presenting layer, range %u..%u pref %.0f",
+                           _range_min, _range_max, preferred);
 
         NSLog(@"winemac: declaring display %u frame-rate range %u..%u Hz with "
-              "preferred %.0f Hz via a 1x1 carrier CAMetalLayer whose "
-              "CAMetalDisplayLink PRESENTS its own drawable every frame "
-              "(WHISKY_DECLARE_FRAME_RATE_RANGE=1)",
+              "preferred %.0f Hz via a CAMetalDisplayLink bound to the PRESENTING "
+              "layer, which blits D3DMetal's latest frame (offscreen "
+              "WineMetalLayer) into its own drawable every tick -- never skipping "
+              "a tick (WHISKY_DECLARE_FRAME_RATE_RANGE=1)",
               (unsigned)display_id, _range_min, _range_max, preferred);
         return YES;
     }
@@ -977,9 +1015,12 @@ static volatile int wine_frame_rate_declaration_pending;
     }
 
     /* Tear the presentation down: the link first (so nothing is presenting and
-       nothing still owns the layer), then the layer, then the device and queue.
-       The carrier itself stays alive and can be re-armed from scratch afterwards,
-       because CAMetalDisplayLink cannot be reused once invalidated. */
+       nothing still owns the layer), then the queues and device.  The
+       presentation and game layers are NOT ours to release -- they belong to
+       the views (the content view's backing layer and the offscreen D3DMetal
+       surface view respectively), so we only drop the references.  The broker
+       itself stays alive and can be re-armed from scratch afterwards, because
+       CAMetalDisplayLink cannot be reused once invalidated. */
     - (void) invalidate
     {
         if (_link)
@@ -990,15 +1031,8 @@ static volatile int wine_frame_rate_declaration_pending;
             [_link release];
             _link = nil;
         }
-        if (_carrier_layer)
-        {
-            [CATransaction begin];
-            [CATransaction setDisableActions:YES];
-            [_carrier_layer removeFromSuperlayer];
-            [CATransaction commit];
-            [_carrier_layer release];
-            _carrier_layer = nil;
-        }
+        _presenting_layer = nil;
+        _game_layer = nil;
         if (_queue)
         {
             [_queue release];
@@ -1031,7 +1065,14 @@ static void wine_frame_rate_declare_on_main_thread(NSView* view)
 
     wine_frame_rate_observe_display_changes();
 
-    window = [view window];
+    /* `view` here is the METAL VIEW D3DMetal presents through -- the offscreen
+       surface in broker mode.  Its window check needs the on-screen sibling
+       (-winePresentationView resolves to the receiver itself outside broker
+       mode, so this is a no-op there), but armForView needs the OFFSCREEN view,
+       because that is the one whose layer carries the -nextDrawable hook and the
+       acquired-drawable stash. */
+    window = [[view winePresentationView] window];
+    wine_broker_diag_w("declare_on_main: surface=%p window=%p", (void*)view, (void*)window);
     if (!window || ![window contentView])
         return;
 
@@ -1150,6 +1191,7 @@ void macdrv_declare_frame_rate_range(NSView* view)
     const char* enabled = getenv("WHISKY_DECLARE_FRAME_RATE_RANGE");
     WineFrameRateRangeCarrier* carrier;
 
+    wine_broker_diag_w("declare_frame_rate_range(view=%p) env=%s", (void*)view, enabled ? enabled : "(unset)");
     if (!enabled || enabled[0] != '1')
         return;
 
@@ -1174,6 +1216,7 @@ void macdrv_declare_frame_rate_range(NSView* view)
 
     if ([NSThread isMainThread])
     {
+        wine_broker_diag_w("declare: main thread -> arming directly");
         wine_frame_rate_declare_on_main_thread(view);
         return;
     }
@@ -1186,14 +1229,20 @@ void macdrv_declare_frame_rate_range(NSView* view)
        cost one dropped dispatch -- the next present retries -- and never leaves
        the flag set with no request outstanding. */
     if (wine_frame_rate_declaration_pending)
+    {
+        static int once = 0;
+        if (!once++) wine_broker_diag_w("declare: pending flag set -> returning (dispatch not serviced?)");
         return;
+    }
     wine_frame_rate_declaration_pending = 1;
+    wine_broker_diag_w("declare: dispatching OnMainThreadAsync");
 
     /* OnMainThreadAsync copies the block, and copying retains the captured view,
        so the view cannot go away underneath this.  The call is asynchronous on
        purpose: -nextDrawable is on D3DMetal's presenting path and must not block
        on the main thread. */
     OnMainThreadAsync(^{
+        wine_broker_diag_w("declare: block RAN on main thread");
         wine_frame_rate_declaration_pending = 0;
         wine_frame_rate_declare_on_main_thread(view);
     });
@@ -1235,9 +1284,17 @@ void macdrv_declare_frame_rate_range(NSView* view)
 @interface WineMetalView : WineBaseView
 {
     id<MTLDevice> _device;
+    BOOL _offscreen;        /* OPT-IN broker mode: outside the view hierarchy */
+    WineMetalView* _presentation_view;  /* OPT-IN broker mode: NOT retained (it is a
+                                           sibling subview; the offscreen view may
+                                           outlive it -- see the broker commentary) */
 }
 
     - (id) initWithFrame:(NSRect)frame device:(id<MTLDevice>)device;
+    - (id) initWithFrame:(NSRect)frame device:(id<MTLDevice>)device offscreen:(BOOL)offscreen;
+    - (void) setOffscreen:(BOOL)offscreen;
+    - (void) setPresentationView:(WineMetalView*)view;
+    - (WineMetalView*) presentationView;
 
 @end
 
@@ -1275,6 +1332,7 @@ void macdrv_declare_frame_rate_range(NSView* view)
     - (void) wine_setBackingSize:(const int*)newBackingSize;
 
     - (WineMetalView*) newMetalViewWithDevice:(id<MTLDevice>)device;
+    - (WineMetalView*) newD3DMetalSurfaceView:(id<MTLDevice>)device;   /* OPT-IN broker mode */
     - (void) addCALayerHostViewWithContextId:(CAContextID)contextId;
     - (void) removeCALayerHostView:(CAContextID)contextId;
     - (void) setCALayerHostState:(CAContextID)contextId hidden:(BOOL)hostHidden zPosition:(CGFloat)zpos;
@@ -1581,7 +1639,40 @@ void macdrv_declare_frame_rate_range(NSView* view)
     {
         if (_metalView) return _metalView;
 
-        WineMetalView* view = [[WineMetalView alloc] initWithFrame:[self bounds] device:device];
+        WineMetalView* view;
+
+        /* OPT-IN BROKER MODE (WHISKY_DECLARE_FRAME_RATE_RANGE=1).  The view
+           D3DMetal renders into is OFFSCREEN -- backed by a WineMetalLayer that
+           lives outside the view hierarchy, so its presents are never
+           composited and cannot compete with the visible layer, which the
+           broker's CAMetalDisplayLink owns and presents.  This is the shape
+           measured to move the panel (broker commentary above).
+
+           The offscreen view is paired with an on-screen WineMetalView, whose
+           layer is the PRESENTING one (the only attachment point that has ever
+           moved this panel).  See -winePresentationView, and the
+           client_surface association set up by d3dmetal.c, which lands on the
+           presentation view either way.
+
+           With the variable unset the original subview arrangement is used,
+           unchanged. */
+        {
+            const char* broker = getenv("WHISKY_DECLARE_FRAME_RATE_RANGE");
+
+            if (broker && broker[0] == '1')
+            {
+                view = [self newD3DMetalSurfaceView:device];
+                if (view)
+                {
+                    _metalView = view;      /* the offscreen D3DMetal surface */
+                    return _metalView;
+                }
+                /* could not create it: fall through to the normal arrangement */
+            }
+        }
+
+        fprintf(stderr, "winemac: NORMAL subview arrangement chosen for the metal view\n");
+        view = [[WineMetalView alloc] initWithFrame:[self bounds] device:device];
         [view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
         [self setAutoresizesSubviews:YES];
         [self addSubview:view positioned:NSWindowBelow relativeTo:nil];
@@ -1590,6 +1681,40 @@ void macdrv_declare_frame_rate_range(NSView* view)
         [(WineWindow*)self.window windowDidDrawContent];
 
         return _metalView;
+    }
+
+    /* OPT-IN (WHISKY_DECLARE_FRAME_RATE_RANGE=1): the view D3DMetal renders into.
+       It is OFFSCREEN -- not a subview of anything, so its presents are never
+       composited and cannot compete with the visible layer the broker's
+       CAMetalDisplayLink owns and presents (see the broker commentary above).
+
+       This must NOT be the D3DMetal surface's own backing layer when broker mode
+       is on: the broker's link takes exclusive ownership of the layer it is
+       bound to, and -nextDrawable on that layer would raise
+       CAMetalLayerInvalidOperation inside D3DMetal.  So the pairing is: the
+       offscreen view (returned here) is D3DMetal's, and the on-screen view added
+       as a subview below is the one the link drives; -winePresentationView
+       resolves from the former to the latter, and d3dmetal.c's client_surface
+       association lands on the presentation view either way.
+
+       Called ONLY when the broker is enabled; with the feature off no such view
+       exists and the original arrangement is used. */
+    - (WineMetalView*) newD3DMetalSurfaceView:(id<MTLDevice>)device
+    {
+        fprintf(stderr, "winemac: BROKER newD3DMetalSurfaceView called (broker ON)\n");
+        /* offscreen:YES at init time -- the backing layer is created inside the
+           initialiser, so the flag must be set there, not afterwards. */
+        WineMetalView* offscreen = [[WineMetalView alloc] initWithFrame:NSZeroRect
+                                                                 device:device
+                                                              offscreen:YES];
+
+        WineMetalView* onscreen = [[WineMetalView alloc] initWithFrame:[self bounds] device:device];
+        [onscreen setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+        [self setAutoresizesSubviews:YES];
+        [self addSubview:onscreen positioned:NSWindowBelow relativeTo:nil];
+        [offscreen setPresentationView:onscreen];
+
+        return offscreen;
     }
 
     - (void) addCALayerHostViewWithContextId:(CAContextID)contextId
@@ -1889,11 +2014,22 @@ void macdrv_declare_frame_rate_range(NSView* view)
 
     - (id) initWithFrame:(NSRect)frame device:(id<MTLDevice>)device
     {
+        return [self initWithFrame:frame device:device offscreen:NO];
+    }
+
+    /* `offscreen` MUST be known before wantsLayer is set: setting wantsLayer
+       creates the backing layer immediately, so -makeBackingLayer (which decides
+       between the D3DMetal WineMetalLayer and the plain visible CAMetalLayer)
+       runs inside this initialiser.  Setting the flag afterwards has no effect
+       on the layer that already exists. */
+    - (id) initWithFrame:(NSRect)frame device:(id<MTLDevice>)device offscreen:(BOOL)offscreen
+    {
         self = [super initWithFrame:frame];
         if (self)
         {
             _device = [device retain];
-            self.wantsLayer = YES;
+            _offscreen = offscreen;
+            self.wantsLayer = YES;          /* creates the backing layer NOW */
             self.layerContentsRedrawPolicy = NSViewLayerContentsRedrawNever;
         }
         return self;
@@ -1914,16 +2050,86 @@ void macdrv_declare_frame_rate_range(NSView* view)
         [super setRetinaMode:mode];
     }
 
+    - (void) setOffscreen:(BOOL)offscreen
+    {
+        _offscreen = offscreen;
+    }
+
+    /* OPT-IN broker mode.  The offscreen view D3DMetal renders into is paired
+       with the on-screen view whose layer the broker's link owns and presents.
+       Deliberately NOT retained: the presentation view is a subview of the
+       content view and dies with the window; a retain here would keep it alive
+       past that.  Every use is guarded against a nil. */
+    - (void) setPresentationView:(WineMetalView*)view
+    {
+        _presentation_view = view;
+    }
+
+    - (WineMetalView*) presentationView
+    {
+        return _presentation_view;
+    }
+
+    /* See the NSView(WinePresentationView) declaration in d3dmetal_objc.h. */
+    - (NSView*) winePresentationView
+    {
+        if (_offscreen && _presentation_view)
+            return _presentation_view;
+        return self;
+    }
+
     - (CALayer*) makeBackingLayer
     {
-        CAMetalLayer *layer = [WineMetalLayer layer];   /* CW HACK 22435 */
+        CAMetalLayer *layer;
+
+        /* OPT-IN BROKER MODE, offscreen flavour: the layer D3DMetal renders
+           into and presents.  It is OUTSIDE the view hierarchy (see
+           -newMetalViewWithDevice: in WineContentView), so its presents are
+           never composited and cannot compete with the visible layer the
+           broker's CAMetalDisplayLink owns and presents.  WineMetalLayer
+           carries the -nextDrawable hook that identifies a D3DMetal-presenting
+           window and stashes the acquired drawable for the broker.
+
+           The VISIBLE (on-screen) flavour is a plain CAMetalLayer, because the
+           broker's link takes exclusive ownership of that layer's drawables --
+           any -nextDrawable on it would raise. */
+        if (_offscreen)
+        {
+            layer = [WineMetalLayer layer];     /* CW HACK 22435 */
+            layer.framebufferOnly = YES;
+            /* The offscreen view is outside the view hierarchy, so AppKit never
+               sets this layer's -delegate; link it explicitly (see
+               -[WineMetalLayer nextDrawable]). */
+            wine_metal_layer_set_owner(layer, self);
+        }
+        else
+        {
+            layer = [CAMetalLayer layer];
+            layer.framebufferOnly = NO;         /* the broker blits INTO this layer */
+            layer.magnificationFilter = kCAFilterNearest;
+            layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
+            layer.contentsScale = retina_on ? 2.0 : 1.0;
+            return layer;
+        }
+
         layer.device = _device;
-        layer.framebufferOnly = YES;
         layer.magnificationFilter = kCAFilterNearest;
         layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
         layer.contentsScale = retina_on ? 2.0 : 1.0;
         return layer;
     }
+
+    /* OPT-IN (WHISKY_DECLARE_FRAME_RATE_RANGE=1): the layer D3DMetal renders
+       into and presents.  It is deliberately NOT a subview of anything -- not
+       in any view hierarchy, so it is never composited and its presents cannot
+       compete with the visible layer's -- and it is NOT the view's backing
+       layer, because in broker mode the backing layer is owned by a
+       CAMetalDisplayLink (which would make -nextDrawable raise
+       CAMetalLayerInvalidOperation inside D3DMetal).
+
+       See -winePresentationView for how the offscreen surface and the
+       presenting view are paired. */
+
 
     - (BOOL) isOpaque
     {
@@ -4991,7 +5197,6 @@ macdrv_metal_layer macdrv_view_get_metal_layer(macdrv_metal_view v)
 
     return (macdrv_metal_layer)layer;
 }
-
 void macdrv_view_release_metal_view(macdrv_metal_view v)
 {
     WineMetalView* view = (WineMetalView*)v;

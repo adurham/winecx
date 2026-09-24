@@ -90,6 +90,20 @@ struct d3dmetal_macdrv_win_data
 C_ASSERT(sizeof(struct d3dmetal_macdrv_win_data) == 120);
 
 void OnMainThread(dispatch_block_t block);
+
+/* TEMPORARY DIAGNOSTIC (rig only, WHISKY_BROKER_DIAG=1). */
+static void wine_broker_diag_c(const char *fmt, ...)
+{
+    static int enabled = -1;
+    FILE *f; va_list ap;
+    if (enabled < 0) enabled = getenv("WHISKY_BROKER_DIAG") ? 1 : 0;
+    if (!enabled) return;
+    f = fopen("/tmp/broker-diag.log", "a");
+    if (!f) return;
+    va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
+    fputc('\n', f); fclose(f);
+}
+
 static void cf_client_surface_release(CFAllocatorRef allocator, const void *client_surface);
 
 static void my_macdrv_init_display_devices(BOOL p1)
@@ -188,14 +202,20 @@ static void my_macdrv_release_metal_device(macdrv_metal_device d)
 
 static macdrv_metal_view my_macdrv_view_create_metal_view(macdrv_view v, macdrv_metal_device d)
 {
+    macdrv_metal_view r;
     TRACE("macdrv_view_create_metal_view %p %p\n", v, d);
-    return macdrv_view_create_metal_view(v, d);
+    r = macdrv_view_create_metal_view(v, d);
+    wine_broker_diag_c("d3dmetal.c: create_metal_view -> %p", (void*)r);
+    return r;
 }
 
 static macdrv_metal_layer my_macdrv_view_get_metal_layer(macdrv_metal_view v)
 {
+    macdrv_metal_layer r;
     TRACE("macdrv_view_get_metal_layer %p\n", v);
-    return macdrv_view_get_metal_layer(v);
+    r = macdrv_view_get_metal_layer(v);
+    wine_broker_diag_c("d3dmetal.c: get_metal_layer(%p) -> %p", (void*)v, (void*)r);
+    return r;
 }
 
 static void my_macdrv_view_release_metal_view(macdrv_metal_view v)
