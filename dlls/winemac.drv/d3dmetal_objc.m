@@ -97,6 +97,12 @@ static void wine_broker_diag(const char* fmt, ...)
     /* Extend [CAMetalLayer nextDrawable] so client_surface_present() can be
      * called for the corresponding client_surface.
      */
+    - (void) dealloc
+    {
+        if (_last_acquired) [_last_acquired release];
+        [super dealloc];
+    }
+
     - (id<CAMetalDrawable>) nextDrawable
     {
         /* CAMetalLayer's delegate is the WineMetalView that contains it (seems like that's always true
@@ -174,10 +180,17 @@ static void wine_broker_diag(const char* fmt, ...)
         /* Remember what we just handed out.  Under broker mode
            (WHISKY_DECLARE_FRAME_RATE_RANGE=1) D3DMetal renders into THIS layer,
            which is offscreen, and the link owns a DIFFERENT, visible layer; the
-           broker blits this drawable's texture into the link's drawable on the
-           main thread.  With the feature off the pointer is simply never read.
-           Not retained on purpose -- see -wineLastAcquiredDrawable. */
-        _last_acquired = drawable;
+           broker blits this drawable's texture into the link's drawable.
+
+           RETAINED FOR EXACTLY ONE FRAME, then released on the next acquire.
+           That is not tidiness: the broker's display-link callback runs on its
+           own thread (wine's main run loop stops being serviced after startup,
+           so a link added there never ticks), and it reads this pointer from
+           there.  A borrowed reference could be deallocated between the read and
+           the blit.  Holding it for one frame keeps the slot out of the pool for
+           only that long, so D3DMetal still gets its frames in flight. */
+        if (_last_acquired) [_last_acquired release];
+        _last_acquired = [drawable retain];
 
         return drawable;
     }

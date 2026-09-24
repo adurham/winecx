@@ -27,7 +27,7 @@
 #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
 
 
-static NSString* const WineAppWaitQueryResponseMode = @"WineAppWaitQueryResponseMode";
+NSString* const WineAppWaitQueryResponseMode = @"WineAppWaitQueryResponseMode";
 static NSString* const WineWillShowPermissionDialogNotification = @"WineWillShowPermissionDialogNotification";
 static NSString* const WineDidShowPermissionDialogNotification = @"WineDidShowPermissionDialogNotification";
 

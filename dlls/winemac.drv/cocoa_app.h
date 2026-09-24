@@ -166,5 +166,14 @@ enum {
 
 void OnMainThreadAsync(dispatch_block_t block);
 
+/* The private run-loop mode wine spins its main loop in while it is waiting for
+ * a query response (see waitUntilQueryDone:timeout:processEvents: in
+ * cocoa_app.m).  Sources added only to NSRunLoopCommonModes are NEVER serviced
+ * while the loop runs in this mode, and a display link registered that way
+ * therefore never fires its callback.  Anything that must tick on the main
+ * thread regardless of what wine is waiting for has to be added to this mode as
+ * well -- exactly as wine's own request source is. */
+extern NSString* const WineAppWaitQueryResponseMode;
+
 void LogError(const char* func, NSString* format, ...);
 void LogErrorv(const char* func, NSString* format, va_list args);

@@ -27,6 +27,7 @@
 #import <QuartzCore/QuartzCore.h>
 #include <dlfcn.h>
 #include <objc/runtime.h>
+#include <time.h>
 #include <stdlib.h>
 
 #import "cocoa_window.h"
@@ -671,6 +672,110 @@ static void wine_broker_diag_w(const char* fmt, ...)
 static volatile int wine_frame_rate_declaration_pending;
 
 
+/* Wine's main run loop is NOT serviced once startup is done: both a
+ * kCFRunLoopDefaultMode timer and one in wine's own WineAppWaitQueryResponseMode
+ * were scheduled on it and NEITHER ever fired, while the game kept presenting
+ * (measured, WHISKY_BROKER_DIAG=1).  A CAMetalDisplayLink added there therefore
+ * never ticks -- which is why the panel stayed pinned at 240 Hz with the broker
+ * correctly armed.  Wine's own CVDisplayLink survives for the same reason this
+ * does: it does not depend on that run loop.
+ *
+ * So the broker's link gets its own thread with its own run loop, created on
+ * demand and torn down with the broker. */
+@interface WineFrameRateLinkThread : NSObject
+{
+    NSThread* _thread;
+    NSRunLoop* _runloop;
+    NSCondition* _ready;
+    CAMetalDisplayLink* _link;      /* not retained: the broker owns it */
+    BOOL _stop;
+}
+
+    - (BOOL) startWithLink:(CAMetalDisplayLink*)link;
+    - (void) stop;
+
+@end
+
+
+@implementation WineFrameRateLinkThread
+
+    - (void) threadMain:(id)unused
+    {
+        (void)unused;
+        @autoreleasepool
+        {
+            @synchronized(self)
+            {
+                _runloop = [[NSRunLoop currentRunLoop] retain];
+                [_ready lock];
+                [_ready signal];
+                [_ready unlock];
+            }
+
+            /* The link is added here, on this thread, so its run loop source is
+               serviced by this loop.  Retained across the add because the broker
+               may be torn down from another thread. */
+            [_link retain];
+            [_link addToRunLoop:_runloop forMode:NSRunLoopCommonModes];
+
+            while (YES)
+            {
+                @autoreleasepool
+                {
+                    BOOL stop;
+
+                    [_ready lock];
+                    stop = _stop;
+                    [_ready unlock];
+
+                    if (stop)
+                        break;
+
+                    [_runloop runMode:NSDefaultRunLoopMode
+                          beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.25]];
+                }
+            }
+
+            [_link invalidate];
+            [_link release];
+            _link = nil;
+        }
+    }
+
+    - (BOOL) startWithLink:(CAMetalDisplayLink*)link
+    {
+        _ready = [[NSCondition alloc] init];
+        _link = link;
+
+        [NSThread detachNewThreadSelector:@selector(threadMain:) toTarget:self withObject:nil];
+
+        /* Wait for the run loop to exist before returning, so the caller can
+           rely on the link being attached. */
+        [_ready lock];
+        [_ready waitUntilDate:[NSDate dateWithTimeIntervalSinceNow:2.0]];
+        [_ready unlock];
+
+        return _runloop != nil;
+    }
+
+    - (void) stop
+    {
+        [_ready lock];
+        _stop = YES;
+        [_ready signal];
+        [_ready unlock];
+    }
+
+    - (void) dealloc
+    {
+        [_ready release];
+        [_runloop release];
+        [super dealloc];
+    }
+
+@end
+
+
 /* The frame-rate broker.  One object per window.  In broker mode it owns the
    CAMetalDisplayLink bound to the layer that presents the visible content, and
    blits D3DMetal's latest frame (from the offscreen WineMetalLayer) into that
@@ -690,6 +795,7 @@ static volatile int wine_frame_rate_declaration_pending;
     unsigned long _game_presents;       /* the game's presents, bumped by -noteGamePresent */
     unsigned long _carrier_seen;        /* _game_presents as of the last frame the broker saw */
     unsigned long _presents;            /* draws the broker has presented (diagnostics) */
+    WineFrameRateLinkThread* _link_thread;   /* the link's OWN run loop thread */
 }
 
     - (BOOL) armForView:(NSView*)metalView;
@@ -816,6 +922,50 @@ static volatile int wine_frame_rate_declaration_pending;
         _presents++;
         if (produced != _carrier_seen)
             _carrier_seen = produced;   /* bookkeeping only; the present above already happened */
+
+        /* TEMPORARY DIAGNOSTIC */
+        {
+            static double last_t; static unsigned long last_p; static int n;
+            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+            double now = ts.tv_sec + ts.tv_nsec / 1e9;
+            if (last_t == 0.0) { last_t = now; last_p = _presents; }
+            else if (now - last_t >= 2.0)
+            {
+                NSWindow* w = nil;
+                NSScreen* sc = nil;
+                CAMetalLayer* pl = (CAMetalLayer*)_presenting_layer;
+
+                for (NSWindow* cand in [NSApp windows])
+                    if ([[cand contentView] isKindOfClass:NSClassFromString(@"WineContentView")]) { w = cand; break; }
+                if (w) sc = [w screen];
+
+                wine_broker_diag_w("TICK %d: presents=%lu (+%lu/2s) drawable=%.0fx%.0f scale=%.1f "
+                                   "layerbounds=%.0fx%.0f layerhidden=%d layerscale=%.1f "
+                                   "win=%.0f,%.0f %.0fx%.0f level=%ld vis=%d occl=0x%lx "
+                                   "screen=%.0fx%.0f nwindows=%lu",
+                                   ++n, _presents, _presents - last_p,
+                                   pl ? pl.drawableSize.width : -1.0, pl ? pl.drawableSize.height : -1.0,
+                                   pl ? pl.contentsScale : -1.0,
+                                   pl ? pl.bounds.size.width : -1.0, pl ? pl.bounds.size.height : -1.0,
+                                   pl ? (int)pl.hidden : -1,
+                                   pl ? pl.contentsScale : -1.0,
+                                   w ? w.frame.origin.x : -9999.0, w ? w.frame.origin.y : -9999.0,
+                                   w ? w.frame.size.width : -1.0, w ? w.frame.size.height : -1.0,
+                                   w ? (long)w.level : -1L,
+                                   w ? (int)w.isVisible : -1,
+                                   w ? (unsigned long)w.occlusionState : 0UL,
+                                   sc ? sc.frame.size.width : -1.0, sc ? sc.frame.size.height : -1.0,
+                                   (unsigned long)[[NSApp windows] count]);
+                wine_broker_diag_w("   app: active=%d keyWindow=%p win.isKey=%d win.canBecomeKey=%d "
+                                   "win.styleMask=0x%lx frontmost=%s",
+                                   (int)[NSApp isActive], (void*)[NSApp keyWindow],
+                                   w ? (int)[w isKeyWindow] : -1,
+                                   w ? (int)[w canBecomeKeyWindow] : -1,
+                                   w ? (unsigned long)[w styleMask] : 0UL,
+                                   w ? [[NSApp frontmostApplication] localizedName].UTF8String : "(n/a)");
+                last_t = now; last_p = _presents;
+            }
+        }
     }
 
     /* Arm the carrier for the metal view, if it is not armed already.  Must run
@@ -966,10 +1116,59 @@ static volatile int wine_frame_rate_declaration_pending;
            includes the default mode, so registering for NSDefaultRunLoopMode as
            well would put the same source in the default mode twice and fire the
            callback twice per refresh. */
-        [link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+        /* NOT on the main run loop: wine stops servicing it once startup is
+           done (measured -- probes in both the default mode and wine's private
+           wait mode never fired while the game kept presenting), so a link added
+           there never ticks.  See WineFrameRateLinkThread above. */
+        /* The native arms that measurably moved this panel made their window
+           KEY and activated the app; a window that is not frontmost leaves the
+           compositor at the panel's maximum.  Match that behaviour for the
+           window the broker is presenting. */
+        {
+            NSWindow* w = [[metalView winePresentationView] window];
+            if (w)
+            {
+                [w makeKeyAndOrderFront:nil];
+                [NSApp activateIgnoringOtherApps:YES];
+                wine_broker_diag_w("arm: made key + activated (window level=%ld)", (long)w.level);
+            }
+        }
+
+        _link_thread = [[WineFrameRateLinkThread alloc] init];
+        if (![_link_thread startWithLink:link])
+        {
+            wine_broker_diag_w("arm: the link thread did not come up");
+            NSLog(@"winemac: the broker's display-link thread did not start; "
+                  "no frame-rate range declared");
+            [_link_thread release];
+            _link_thread = nil;
+            [self invalidate];
+            _decided = YES;
+            return NO;
+        }
+
+        /* TEMPORARY DIAGNOSTIC: two one-shot probes, one per mode, so we learn
+           which loop actually gets serviced. */
+        {
+            CFRunLoopTimerRef t1 = CFRunLoopTimerCreateWithHandler(NULL,
+                CFAbsoluteTimeGetCurrent() + 1.0, 0, 0, 0, ^(CFRunLoopTimerRef tt){
+                    (void)tt; wine_broker_diag_w("PROBE default/common FIRED");
+                });
+            CFRunLoopTimerRef t2 = CFRunLoopTimerCreateWithHandler(NULL,
+                CFAbsoluteTimeGetCurrent() + 2.0, 0, 0, 0, ^(CFRunLoopTimerRef tt){
+                    (void)tt; wine_broker_diag_w("PROBE waitmode FIRED");
+                });
+            CFRunLoopAddTimer(CFRunLoopGetMain(), t1, kCFRunLoopDefaultMode);
+            CFRunLoopAddTimer(CFRunLoopGetMain(), t2, (CFStringRef)WineAppWaitQueryResponseMode);
+            CFRunLoopWakeUp(CFRunLoopGetMain());
+            CFRelease(t1); CFRelease(t2);
+            wine_broker_diag_w("PROBE: scheduled (default t+1s, waitmode t+2s)");
+        }
         _link = link;
         _declared = YES;
         _decided = YES;
+
+
         wine_broker_diag_w("ARMED: link live on presenting layer, range %u..%u pref %.0f",
                            _range_min, _range_max, preferred);
 
@@ -1030,6 +1229,12 @@ static volatile int wine_frame_rate_declaration_pending;
             [_link invalidate];     /* also removes the run loop source */
             [_link release];
             _link = nil;
+        }
+        if (_link_thread)
+        {
+            [_link_thread stop];
+            [_link_thread release];
+            _link_thread = nil;
         }
         _presenting_layer = nil;
         _game_layer = nil;
@@ -1192,6 +1397,11 @@ void macdrv_declare_frame_rate_range(NSView* view)
     WineFrameRateRangeCarrier* carrier;
 
     wine_broker_diag_w("declare_frame_rate_range(view=%p) env=%s", (void*)view, enabled ? enabled : "(unset)");
+    {
+        static int hb; static int last;
+        if (++hb - last >= 300) { last = hb;
+            wine_broker_diag_w("HEARTBEAT %d declares seen", hb); }
+    }
     if (!enabled || enabled[0] != '1')
         return;
 
@@ -1439,6 +1649,34 @@ void macdrv_declare_frame_rate_range(NSView* view)
             [self setAutoresizesSubviews:NO];
         }
         return self;
+    }
+
+    /* OPT-IN BROKER MODE.  The presenting layer must be THIS view's own backing
+       layer, not a subview's: measured on this panel, a full-size sublayer does
+       not work at all (median 240.00 Hz, 98.8% of samples >200 Hz) while the
+       window's content layer does (~60 Hz).  The link owns the layer it is bound
+       to, so in broker mode no subview may be a CAMetalLayer and no -nextDrawable
+       may happen here -- the game's drawables live on the offscreen surface.
+
+       With the variable unset this returns the ordinary layer and nothing
+       changes. */
+    - (CALayer*) makeBackingLayer
+    {
+        const char* broker = getenv("WHISKY_DECLARE_FRAME_RATE_RANGE");
+
+        if (broker && broker[0] == '1')
+        {
+            CAMetalLayer* layer = [CAMetalLayer layer];
+            layer.device = MTLCreateSystemDefaultDevice();
+            layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+            layer.framebufferOnly = NO;      /* the broker blits INTO it */
+            layer.magnificationFilter = kCAFilterNearest;
+            layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
+            layer.contentsScale = retina_on ? 2.0 : 1.0;
+            return layer;
+        }
+
+        return [super makeBackingLayer];
     }
 
     - (void) dealloc
@@ -1708,11 +1946,10 @@ void macdrv_declare_frame_rate_range(NSView* view)
                                                                  device:device
                                                               offscreen:YES];
 
-        WineMetalView* onscreen = [[WineMetalView alloc] initWithFrame:[self bounds] device:device];
-        [onscreen setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
-        [self setAutoresizesSubviews:YES];
-        [self addSubview:onscreen positioned:NSWindowBelow relativeTo:nil];
-        [offscreen setPresentationView:onscreen];
+        /* The presentation view is this CONTENT VIEW itself: its own backing
+           layer is the one the link owns.  No subview is created at all -- a
+           full-size sublayer measurably fails to move this panel. */
+        [offscreen setPresentationView:self];
 
         return offscreen;
     }
