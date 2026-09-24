@@ -923,7 +923,9 @@ static volatile int wine_frame_rate_declaration_pending;
         if (produced != _carrier_seen)
             _carrier_seen = produced;   /* bookkeeping only; the present above already happened */
 
-        /* TEMPORARY DIAGNOSTIC */
+        /* TEMPORARY DIAGNOSTIC.  Thread-safe only: this runs on the link's own
+           thread, so NO AppKit calls here (touching NSApp/windows off the main
+           thread raises and kills the process). */
         {
             static double last_t; static unsigned long last_p; static int n;
             struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -931,38 +933,13 @@ static volatile int wine_frame_rate_declaration_pending;
             if (last_t == 0.0) { last_t = now; last_p = _presents; }
             else if (now - last_t >= 2.0)
             {
-                NSWindow* w = nil;
-                NSScreen* sc = nil;
                 CAMetalLayer* pl = (CAMetalLayer*)_presenting_layer;
-
-                for (NSWindow* cand in [NSApp windows])
-                    if ([[cand contentView] isKindOfClass:NSClassFromString(@"WineContentView")]) { w = cand; break; }
-                if (w) sc = [w screen];
-
-                wine_broker_diag_w("TICK %d: presents=%lu (+%lu/2s) drawable=%.0fx%.0f scale=%.1f "
-                                   "layerbounds=%.0fx%.0f layerhidden=%d layerscale=%.1f "
-                                   "win=%.0f,%.0f %.0fx%.0f level=%ld vis=%d occl=0x%lx "
-                                   "screen=%.0fx%.0f nwindows=%lu",
-                                   ++n, _presents, _presents - last_p,
+                wine_broker_diag_w("TICK %d: presents=%lu (+%.1f/s) drawable=%.0fx%.0f "
+                                   "layerbounds=%.0fx%.0f scale=%.1f game=%p",
+                                   ++n, _presents, (_presents - last_p) / (now - last_t),
                                    pl ? pl.drawableSize.width : -1.0, pl ? pl.drawableSize.height : -1.0,
-                                   pl ? pl.contentsScale : -1.0,
                                    pl ? pl.bounds.size.width : -1.0, pl ? pl.bounds.size.height : -1.0,
-                                   pl ? (int)pl.hidden : -1,
-                                   pl ? pl.contentsScale : -1.0,
-                                   w ? w.frame.origin.x : -9999.0, w ? w.frame.origin.y : -9999.0,
-                                   w ? w.frame.size.width : -1.0, w ? w.frame.size.height : -1.0,
-                                   w ? (long)w.level : -1L,
-                                   w ? (int)w.isVisible : -1,
-                                   w ? (unsigned long)w.occlusionState : 0UL,
-                                   sc ? sc.frame.size.width : -1.0, sc ? sc.frame.size.height : -1.0,
-                                   (unsigned long)[[NSApp windows] count]);
-                wine_broker_diag_w("   app: active=%d keyWindow=%p win.isKey=%d win.canBecomeKey=%d "
-                                   "win.styleMask=0x%lx frontmost=%s",
-                                   (int)[NSApp isActive], (void*)[NSApp keyWindow],
-                                   w ? (int)[w isKeyWindow] : -1,
-                                   w ? (int)[w canBecomeKeyWindow] : -1,
-                                   w ? (unsigned long)[w styleMask] : 0UL,
-                                   w ? [[NSApp frontmostApplication] localizedName].UTF8String : "(n/a)");
+                                   pl ? pl.contentsScale : -1.0, (void*)game_drawable);
                 last_t = now; last_p = _presents;
             }
         }
@@ -1110,7 +1087,32 @@ static volatile int wine_frame_rate_declaration_pending;
             return NO;
         }
 
-        link.preferredFrameRateRange = CAFrameRateRangeMake(_range_min, _range_max, preferred);
+        /* The declared RANGE is a permission, not a bound: declaring the panel's
+           full 48..240 tells the compositor "240 is acceptable for this content",
+           and macOS will take it whenever it prefers (documented behaviour; see
+           WWDC21 10147 and VRR-MACOS-SEMANTICS).  Apple's sanctioned pattern is
+           the range matching the signal actually being sent.  So by default
+           The MEASURED result is the opposite of what that predicts, for this
+           panel: declaring the matched [preferred, preferred] range was WORSE
+           (median 110.50 Hz, 37.5% of samples above 200 Hz) than declaring the
+           panel's own 48..240.  So the panel's range stays the default and the
+           matched form is available only for experiments, via
+           WHISKY_DECLARE_FRAME_RATE_MATCHED=1. */
+        {
+            const char* matched = getenv("WHISKY_DECLARE_FRAME_RATE_MATCHED");
+            uint32_t lo = (matched && matched[0] == '1') ? (uint32_t)preferred : _range_min;
+            uint32_t hi = (matched && matched[0] == '1') ? (uint32_t)preferred : _range_max;
+
+            if (lo < _range_min) lo = _range_min;
+            if (lo > _range_max) lo = _range_max;
+            if (hi < lo) hi = lo;
+            if (hi > _range_max) hi = _range_max;
+
+            wine_broker_diag_w("arm: declaring range %u..%u pref %.0f (%s)",
+                               lo, hi, preferred,
+                               (matched && matched[0]=='1') ? "MATCHED" : "panel-range");
+            link.preferredFrameRateRange = CAFrameRateRangeMake(lo, hi, preferred);
+        }
         link.delegate = self;
         /* Common modes only.  NSRunLoopCommonModes is a SET of modes that already
            includes the default mode, so registering for NSDefaultRunLoopMode as
