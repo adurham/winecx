@@ -28,6 +28,7 @@
 #include <dlfcn.h>
 #include <objc/runtime.h>
 #include <time.h>
+#include <math.h>
 #include <stdlib.h>
 
 #import "cocoa_window.h"
@@ -927,20 +928,31 @@ static volatile int wine_frame_rate_declaration_pending;
            thread, so NO AppKit calls here (touching NSApp/windows off the main
            thread raises and kills the process). */
         {
-            static double last_t; static unsigned long last_p; static int n;
+            static double last_t, prev_tick, sum_dt, sumsq_dt, mn_dt = 1e9, mx_dt;
+            static unsigned long last_p, n_ticks, n_gaps; static int n;
             struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
             double now = ts.tv_sec + ts.tv_nsec / 1e9;
+            if (prev_tick > 0.0) {
+                double dt = now - prev_tick;
+                n_ticks++; sum_dt += dt; sumsq_dt += dt * dt;
+                if (dt < mn_dt) mn_dt = dt;
+                if (dt > mx_dt) mx_dt = dt;
+                if (n_ticks > 4 && dt > 1.5 * (sum_dt / n_ticks)) n_gaps++;
+            }
+            prev_tick = now;
             if (last_t == 0.0) { last_t = now; last_p = _presents; }
             else if (now - last_t >= 2.0)
             {
-                CAMetalLayer* pl = (CAMetalLayer*)_presenting_layer;
-                wine_broker_diag_w("TICK %d: presents=%lu (+%.1f/s) drawable=%.0fx%.0f "
-                                   "layerbounds=%.0fx%.0f scale=%.1f game=%p",
+                double tmean = n_ticks ? sum_dt / n_ticks : 0.0;
+                double tsd = n_ticks ? sqrt(fabs(sumsq_dt / n_ticks - tmean * tmean)) : 0.0;
+                wine_broker_diag_w("TICK %d: presents=%lu (+%.1f/s) tickint n=%lu mean=%.3fms "
+                                   "sd=%.3fms min=%.3fms max=%.3fms gaps=%lu game=%p",
                                    ++n, _presents, (_presents - last_p) / (now - last_t),
-                                   pl ? pl.drawableSize.width : -1.0, pl ? pl.drawableSize.height : -1.0,
-                                   pl ? pl.bounds.size.width : -1.0, pl ? pl.bounds.size.height : -1.0,
-                                   pl ? pl.contentsScale : -1.0, (void*)game_drawable);
+                                   n_ticks, tmean * 1e3, tsd * 1e3,
+                                   n_ticks ? mn_dt * 1e3 : 0.0, n_ticks ? mx_dt * 1e3 : 0.0,
+                                   n_gaps, (void*)game_drawable);
                 last_t = now; last_p = _presents;
+                n_ticks = 0; sum_dt = sumsq_dt = 0.0; mn_dt = 1e9; mx_dt = 0.0; n_gaps = 0;
             }
         }
     }
